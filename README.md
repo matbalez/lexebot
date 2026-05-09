@@ -37,13 +37,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.0-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.0/lexebot-v0.1.0-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.0-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.0/lexebot-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.1-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.1/lexebot-v0.1.1-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.1-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.1/lexebot-v0.1.1-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.1-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.0-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.1-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
@@ -78,6 +78,7 @@ LEXEBOT_MAX_SEND_AMOUNT=100000
 LEXEBOT_INVOICE_EXPIRATION_SECS=3600
 LEXEBOT_NETWORK=mainnet
 LEXEBOT_OWNER_DISPLAY_NAME=Mat
+LEXEBOT_KUDOS_BOT_PUBKEY=<kudos-bot-pubkey-hex>
 ```
 
 `LEXEBOT_MAX_SEND_AMOUNT` is expressed in ₿ base units. If set, `send` commands
@@ -87,6 +88,30 @@ On startup, LexeBot tries to read the owner's Sprout/Nostr profile and publishes
 its bot profile as `<owner display name>'s LexeBot`, for example
 `Mat's LexeBot`. Set `LEXEBOT_OWNER_DISPLAY_NAME` only as an optional override
 or fallback if profile lookup is unavailable.
+
+The published profile also includes a public `lexebot` discovery object:
+
+```json
+{
+  "owner_pubkey": "<owner-pubkey-hex>",
+  "owner_auth": ["auth", "<owner-pubkey-hex>", "", "<owner-signature>"],
+  "bolt12_offer": "lno1..."
+}
+```
+
+Other bots can verify `owner_auth` against the LexeBot pubkey before treating
+the profile as an owner-to-LexeBot mapping. `bolt12_offer` is a reusable
+no-minimum BOLT12 offer generated on startup.
+
+If `LEXEBOT_KUDOS_BOT_PUBKEY` is set, LexeBot accepts a narrow machine command
+from that Kudos bot:
+
+```text
+@LexeBot auto-kudos <sender-pubkey> <receiver-pubkey> ₿500 to <payment-target>
+```
+
+The command only executes when `<sender-pubkey>` is this LexeBot's configured
+owner. Normal wallet commands still require the owner pubkey.
 
 If startup logs say the bot could not self-add as a channel member, add the
 printed bot pubkey to the channel as a bot using a Sprout identity allowed to

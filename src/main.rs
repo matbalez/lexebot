@@ -96,6 +96,12 @@ impl LexeClient {
             BotCommand::GetBolt12 => self.get_bolt12().await,
             BotCommand::CreateInvoice { amount } => self.create_invoice(amount).await,
             BotCommand::Send { amount, payable } => self.send_payment(amount, payable).await,
+            BotCommand::AutoKudosSend {
+                amount, payable, ..
+            } => {
+                let payment = self.send_payment(amount, payable).await?;
+                Ok(format!("Auto-kudos {payment}"))
+            }
         }
     }
 
@@ -132,6 +138,13 @@ impl LexeClient {
     }
 
     async fn get_bolt12(&self) -> Result<String> {
+        Ok(format!(
+            "BOLT12 offer:\n{}",
+            self.create_bolt12_offer().await?
+        ))
+    }
+
+    async fn create_bolt12_offer(&self) -> Result<String> {
         let response = self
             .wallet
             .create_offer(CreateOfferRequest {
@@ -141,7 +154,7 @@ impl LexeClient {
             })
             .await?;
 
-        Ok(format!("BOLT12 offer:\n{}", response.offer))
+        Ok(response.offer.to_string())
     }
 
     async fn send_payment(&self, amount: u64, payable: String) -> Result<String> {
@@ -216,7 +229,8 @@ async fn run_forever(runtime: Runtime) -> Result<()> {
 async fn run_session(runtime: &Runtime) -> Result<()> {
     let mut ws = connect_and_authenticate(&runtime.config).await?;
     let bot_display_name = resolve_bot_display_name(&mut ws, &runtime.config).await;
-    publish_profile(&mut ws, &runtime.config, &bot_display_name).await?;
+    let bolt12_offer = runtime.lexe.create_bolt12_offer().await?;
+    publish_profile(&mut ws, &runtime.config, &bot_display_name, &bolt12_offer).await?;
     announce_channel_membership(&mut ws, &runtime.config).await?;
     subscribe_to_channel(&mut ws, &runtime.config.channel_id).await?;
 
@@ -273,6 +287,7 @@ struct Config {
     owner_pubkey: PublicKey,
     owner_display_name_override: Option<String>,
     owner_auth_tag: Option<Tag>,
+    kudos_bot_pubkey: Option<PublicKey>,
 }
 
 impl Config {
@@ -287,6 +302,7 @@ impl Config {
         let owner_display_name_override = std::env::var("LEXEBOT_OWNER_DISPLAY_NAME")
             .ok()
             .and_then(|value| clean_display_name(&value));
+        let kudos_bot_pubkey = optional_pubkey_env("LEXEBOT_KUDOS_BOT_PUBKEY")?;
 
         let auth_mode =
             std::env::var("SPROUT_BOT_AUTH_MODE").unwrap_or_else(|_| "standalone".to_string());
@@ -305,6 +321,7 @@ impl Config {
             owner_pubkey,
             owner_display_name_override,
             owner_auth_tag,
+            kudos_bot_pubkey,
         })
     }
 }
@@ -339,8 +356,14 @@ fn build_auth_event(config: &Config, challenge: &str) -> Result<Event> {
     }
 }
 
-async fn publish_profile(ws: &mut Ws, config: &Config, display_name: &str) -> Result<()> {
-    let profile_event = build_profile(display_name).sign_with_keys(&config.bot_keys)?;
+async fn publish_profile(
+    ws: &mut Ws,
+    config: &Config,
+    display_name: &str,
+    bolt12_offer: &str,
+) -> Result<()> {
+    let profile_event =
+        build_profile(config, display_name, bolt12_offer).sign_with_keys(&config.bot_keys)?;
     let profile_event_id = profile_event.id.to_hex();
 
     send_json(ws, json!(["EVENT", profile_event])).await?;
@@ -349,7 +372,7 @@ async fn publish_profile(ws: &mut Ws, config: &Config, display_name: &str) -> Re
     Ok(())
 }
 
-fn build_profile(display_name: &str) -> EventBuilder {
+fn build_profile(config: &Config, display_name: &str, bolt12_offer: &str) -> EventBuilder {
     EventBuilder::new(
         Kind::Custom(0),
         json!({
@@ -357,6 +380,12 @@ fn build_profile(display_name: &str) -> EventBuilder {
             "name": BOT_NAME,
             "picture": BOT_ICON_DATA_URL,
             "about": BOT_ABOUT,
+            "lexebot": {
+                "version": 1,
+                "owner_pubkey": config.owner_pubkey.to_hex(),
+                "owner_auth": config.owner_auth_tag.as_ref().map(auth_tag_json),
+                "bolt12_offer": bolt12_offer,
+            },
         })
         .to_string(),
         [],
@@ -452,6 +481,16 @@ fn clean_display_name(value: &str) -> Option<String> {
     (!collapsed.is_empty()).then_some(collapsed)
 }
 
+fn auth_tag_json(tag: &Tag) -> Value {
+    Value::Array(
+        tag.as_slice()
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect::<Vec<_>>(),
+    )
+}
+
 async fn announce_channel_membership(ws: &mut Ws, config: &Config) -> Result<()> {
     let builder = EventBuilder::new(
         Kind::Custom(9000),
@@ -545,16 +584,18 @@ async fn maybe_reply(
         return Ok(());
     }
 
-    let reply = if event.pubkey != runtime.config.owner_pubkey {
-        "Only this LexeBot's configured owner can use wallet commands.".to_string()
-    } else {
-        match parse_command(&event.content) {
-            Ok(command) => match runtime.lexe.execute(command).await {
+    let reply = match parse_command(&event.content) {
+        Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => {
+            match runtime.lexe.execute(command).await {
                 Ok(reply) => reply,
                 Err(err) => format!("Lexe command failed: {err:#}"),
-            },
-            Err(err) => format!("Invalid LexeBot command: {err}"),
+            }
         }
+        Ok(_) => {
+            "Only this LexeBot's configured owner or configured Kudos bot can use wallet commands."
+                .to_string()
+        }
+        Err(err) => format!("Invalid LexeBot command: {err}"),
     };
 
     let reply_event = build_message(
@@ -568,6 +609,22 @@ async fn maybe_reply(
     send_json(ws, json!(["EVENT", reply_event])).await?;
     eprintln!("replied to {} with {}", event.id.to_hex(), reply_event_id);
     Ok(())
+}
+
+fn command_authorized(command: &BotCommand, sender: PublicKey, config: &Config) -> bool {
+    if sender == config.owner_pubkey {
+        return true;
+    }
+
+    let BotCommand::AutoKudosSend {
+        sender: kudos_sender,
+        ..
+    } = command
+    else {
+        return false;
+    };
+
+    config.kudos_bot_pubkey == Some(sender) && *kudos_sender == config.owner_pubkey
 }
 
 fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result<EventBuilder> {
@@ -586,8 +643,19 @@ fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result
 enum BotCommand {
     GetBalance,
     GetBolt12,
-    CreateInvoice { amount: u64 },
-    Send { amount: u64, payable: String },
+    CreateInvoice {
+        amount: u64,
+    },
+    Send {
+        amount: u64,
+        payable: String,
+    },
+    AutoKudosSend {
+        sender: PublicKey,
+        receiver: PublicKey,
+        amount: u64,
+        payable: String,
+    },
 }
 
 fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
@@ -612,6 +680,7 @@ fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
         "get" => parse_get_command(rest),
         "create" => parse_create_command(rest),
         "send" => parse_send_command(rest),
+        "auto-kudos" => parse_auto_kudos_command(rest),
         _ => Err(command_help()),
     }
 }
@@ -640,6 +709,23 @@ fn parse_send_command(tokens: &[&str]) -> std::result::Result<BotCommand, String
             payable: (*payable).to_string(),
         }),
         _ => Err("expected `@LexeBot send ₿500 to <payment-target>`".to_string()),
+    }
+}
+
+fn parse_auto_kudos_command(tokens: &[&str]) -> std::result::Result<BotCommand, String> {
+    match tokens {
+        [sender, receiver, amount, "to", payable] => Ok(BotCommand::AutoKudosSend {
+            sender: PublicKey::from_hex(sender)
+                .map_err(|_| "auto-kudos sender must be a hex pubkey".to_string())?,
+            receiver: PublicKey::from_hex(receiver)
+                .map_err(|_| "auto-kudos receiver must be a hex pubkey".to_string())?,
+            amount: parse_amount_token(amount)?,
+            payable: (*payable).to_string(),
+        }),
+        _ => Err(
+            "expected `@LexeBot auto-kudos <sender-pubkey> <receiver-pubkey> ₿500 to <payment-target>`"
+                .to_string(),
+        ),
     }
 }
 
@@ -968,6 +1054,16 @@ fn optional_u32_env(name: &str) -> Result<Option<u32>> {
         .transpose()
 }
 
+fn optional_pubkey_env(name: &str) -> Result<Option<PublicKey>> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            PublicKey::from_hex(&value).with_context(|| format!("{name} must be a hex pubkey"))
+        })
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1112,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_auto_kudos_command() {
+        let sender = Keys::generate().public_key();
+        let receiver = Keys::generate().public_key();
+        assert_eq!(
+            parse_command(&format!(
+                "@lexebot auto-kudos {} {} ₿500 to lno1abc",
+                sender.to_hex(),
+                receiver.to_hex()
+            )),
+            Ok(BotCommand::AutoKudosSend {
+                sender,
+                receiver,
+                amount: 500,
+                payable: "lno1abc".to_string()
+            })
+        );
+    }
+
+    #[test]
     fn rejects_non_strict_commands() {
         assert!(parse_command("hey @lexebot get balance").is_err());
         assert!(parse_command("@lexebot balance").is_err());
@@ -1052,6 +1167,7 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_display_name_override: None,
             owner_auth_tag: None,
+            kudos_bot_pubkey: None,
         };
 
         assert!(event_mentions_bot(&event, &config));
@@ -1072,9 +1188,43 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_display_name_override: None,
             owner_auth_tag: None,
+            kudos_bot_pubkey: None,
         };
 
         assert!(!event_mentions_bot(&event, &config));
+    }
+
+    #[test]
+    fn auto_kudos_requires_configured_kudos_bot_and_owner_sender() {
+        let owner_keys = Keys::generate();
+        let bot_keys = Keys::generate();
+        let kudos_keys = Keys::generate();
+        let receiver = Keys::generate().public_key();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_id: "test-channel".to_string(),
+            bot_keys,
+            owner_pubkey: owner_keys.public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: Some(kudos_keys.public_key()),
+        };
+        let command = BotCommand::AutoKudosSend {
+            sender: owner_keys.public_key(),
+            receiver,
+            amount: 1,
+            payable: "lno1abc".to_string(),
+        };
+        assert!(command_authorized(
+            &command,
+            kudos_keys.public_key(),
+            &config
+        ));
+        assert!(!command_authorized(
+            &command,
+            Keys::generate().public_key(),
+            &config
+        ));
     }
 
     #[test]
