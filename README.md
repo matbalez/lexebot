@@ -32,6 +32,26 @@ Bitcoin Address, Lightning Address, or on-chain/BIP321 URI.
 
 LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 
+### Public Binary
+
+For Apple Silicon Macs:
+
+```bash
+curl -L -o lexebot-v0.1.0-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.0/lexebot-v0.1.0-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.0-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.0/lexebot-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
+mkdir -p ~/.local/bin
+tar -xzf lexebot-v0.1.0-aarch64-apple-darwin.tar.gz
+mv lexebot ~/.local/bin/lexebot
+chmod 700 ~/.local/bin/lexebot
+```
+
+Make sure `~/.local/bin` is on your `PATH`.
+
+### From Source
+
 Generate a bot identity:
 
 ```bash
@@ -70,7 +90,8 @@ or fallback if profile lookup is unavailable.
 
 If startup logs say the bot could not self-add as a channel member, add the
 printed bot pubkey to the channel as a bot using a Sprout identity allowed to
-add members.
+add members. In Flint Alpha, Steve and DK can run this themselves if they have
+admin privileges.
 
 ```bash
 SPROUT_PRIVATE_KEY=<your-existing-sprout-nsec-or-hex-secret> \
