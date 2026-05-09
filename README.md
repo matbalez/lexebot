@@ -1,0 +1,135 @@
+# LexeBot
+
+A deterministic Sprout bot that runs locally and lets one configured owner
+control a Lexe wallet from a Sprout channel.
+
+LexeBot is not AI-powered. It holds a Nostr bot key for Sprout messages and a
+Lexe SDK client credential string supplied locally by the user. It only accepts
+commands from `LEXEBOT_OWNER_PUBKEY`.
+
+## Commands
+
+Commands require an explicit mention tag for the bot pubkey. In Sprout, select
+LexeBot from mention autocomplete. If the bot profile is personalized, the
+visible mention can include the owner display name, for example
+`@Mat's LexeBot get balance`.
+
+```text
+@LexeBot get balance
+@LexeBot get BOLT12
+@LexeBot create invoice for ₿1,000
+@LexeBot send ₿500 to <payment-target>
+```
+
+`get BOLT12` creates and returns a reusable Lexe BOLT12 offer with no minimum
+amount.
+
+`<payment-target>` is passed to Lexe's generic payment parser. Use whatever the
+installed Lexe Rust SDK accepts, such as a BOLT11 invoice, BOLT12 offer, Human
+Bitcoin Address, Lightning Address, or on-chain/BIP321 URI.
+
+## Run Locally
+
+LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
+
+Generate a bot identity:
+
+```bash
+cargo +1.90.0 run --manifest-path /Users/mattyb/.sprout/REPOS/lexebot/Cargo.toml -- --generate-key
+```
+
+Run LexeBot:
+
+```bash
+SPROUT_RELAY_URL=wss://sprout.up.railway.app \
+SPROUT_CHANNEL_ID=<channel-uuid> \
+SPROUT_BOT_PRIVATE_KEY=<bot-nsec-or-hex-secret> \
+SPROUT_OWNER_PRIVATE_KEY=<your-sprout-owner-or-agent-secret> \
+SPROUT_BOT_AUTH_MODE=owner-attested \
+LEXEBOT_OWNER_PUBKEY=<owner-pubkey-hex> \
+LEXE_CLIENT_CREDENTIALS=<lexe-client-credentials> \
+cargo +1.90.0 run --manifest-path /Users/mattyb/.sprout/REPOS/lexebot/Cargo.toml
+```
+
+Optional:
+
+```bash
+LEXEBOT_MAX_SEND_AMOUNT=100000
+LEXEBOT_INVOICE_EXPIRATION_SECS=3600
+LEXEBOT_NETWORK=mainnet
+LEXEBOT_OWNER_DISPLAY_NAME=Mat
+```
+
+`LEXEBOT_MAX_SEND_AMOUNT` is expressed in ₿ base units. If set, `send` commands
+above that amount are rejected.
+
+On startup, LexeBot tries to read the owner's Sprout/Nostr profile and publishes
+its bot profile as `<owner display name>'s LexeBot`, for example
+`Mat's LexeBot`. Set `LEXEBOT_OWNER_DISPLAY_NAME` only as an optional override
+or fallback if profile lookup is unavailable.
+
+If startup logs say the bot could not self-add as a channel member, add the
+printed bot pubkey to the channel as a bot using a Sprout identity allowed to
+add members.
+
+```bash
+SPROUT_PRIVATE_KEY=<your-existing-sprout-nsec-or-hex-secret> \
+sprout add-channel-member \
+  --channel <channel-uuid> \
+  --pubkey <lexebot-pubkey-hex> \
+  --role bot
+```
+
+If you are running the CLI from the Sprout repo instead of an installed `sprout`
+binary:
+
+```bash
+cd /Users/mattyb/.sprout/REPOS/sprout
+SPROUT_PRIVATE_KEY=<your-existing-sprout-nsec-or-hex-secret> \
+cargo run -p sprout-cli -- \
+  --relay wss://sprout.up.railway.app \
+  add-channel-member \
+  --channel <channel-uuid> \
+  --pubkey <lexebot-pubkey-hex> \
+  --role bot
+```
+
+## Safety Model
+
+- The bot only responds when the event has a `p` tag for the LexeBot pubkey.
+- The bot only executes commands from `LEXEBOT_OWNER_PUBKEY`.
+- The bot ignores its own messages and messages from before startup.
+- Relay disconnects are retried with bounded backoff.
+- Lexe client credentials are read from the local environment and never posted
+  to Sprout.
+
+## Packaging
+
+Today, the simplest local install path is Cargo:
+
+```bash
+cargo +1.90.0 install --path /Users/mattyb/.sprout/REPOS/lexebot --locked
+```
+
+Once this repo is hosted, the recommended public install command is:
+
+```bash
+cargo +1.90.0 install --git https://github.com/<owner>/lexebot --locked
+```
+
+The next packaging step should be a small `lexebot init` flow that:
+
+- generates a Sprout bot key
+- asks for the owner's Sprout pubkey
+- writes a local `.env` file outside the repo
+- prints the exact `sprout add-channel-member` command for the bot pubkey
+- never stores or uploads Lexe client credentials anywhere except the user's
+  local machine
+
+After that is stable, ship signed GitHub release binaries and a Homebrew tap for
+non-Rust users.
+
+## Sources
+
+- Lexe Rust quickstart: https://docs.lexe.tech/rust/quickstart/
+- Lexe Rust API docs: https://rust.lexe.tech/
