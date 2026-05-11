@@ -297,8 +297,6 @@ impl Config {
         let channel_id = required_env("SPROUT_CHANNEL_ID")?;
         let bot_keys = Keys::parse(&required_env("SPROUT_BOT_PRIVATE_KEY")?)
             .context("SPROUT_BOT_PRIVATE_KEY must be an nsec or hex private key")?;
-        let owner_pubkey = PublicKey::from_hex(&required_env("LEXEBOT_OWNER_PUBKEY")?)
-            .context("LEXEBOT_OWNER_PUBKEY must be a 64-character hex pubkey")?;
         let owner_display_name_override = std::env::var("LEXEBOT_OWNER_DISPLAY_NAME")
             .ok()
             .and_then(|value| clean_display_name(&value));
@@ -306,9 +304,9 @@ impl Config {
 
         let auth_mode =
             std::env::var("SPROUT_BOT_AUTH_MODE").unwrap_or_else(|_| "standalone".to_string());
-        let owner_auth_tag = match auth_mode.as_str() {
-            "standalone" => None,
-            "owner-attested" => Some(owner_auth_tag(&bot_keys)?),
+        let (owner_pubkey, owner_auth_tag) = match auth_mode.as_str() {
+            "standalone" => (owner_pubkey_from_env()?, None),
+            "owner-attested" => owner_identity_from_attestation(&bot_keys)?,
             other => bail!(
                 "SPROUT_BOT_AUTH_MODE must be 'standalone' or 'owner-attested', got {other:?}"
             ),
@@ -804,20 +802,44 @@ fn reply_mentions(event: &Event, config: &Config) -> Vec<String> {
     pubkeys
 }
 
-fn owner_auth_tag(bot_keys: &Keys) -> Result<Tag> {
-    let tag_json = match std::env::var("SPROUT_AUTH_TAG") {
-        Ok(value) if !value.trim().is_empty() => value,
+fn owner_identity_from_attestation(bot_keys: &Keys) -> Result<(PublicKey, Option<Tag>)> {
+    let (owner, tag_json) = match std::env::var("SPROUT_AUTH_TAG") {
+        Ok(value) if !value.trim().is_empty() => {
+            let owner = verify_auth_tag(&value, &bot_keys.public_key())
+                .context("SPROUT_AUTH_TAG is not valid for SPROUT_BOT_PRIVATE_KEY")?;
+            (owner, value)
+        }
         _ => {
             let owner_keys = Keys::parse(&required_env("SPROUT_OWNER_PRIVATE_KEY")?)
                 .context("SPROUT_OWNER_PRIVATE_KEY must be an nsec or hex private key")?;
-            compute_auth_tag(&owner_keys, &bot_keys.public_key(), "")?
+            let owner = owner_keys.public_key();
+            let tag_json = compute_auth_tag(&owner_keys, &bot_keys.public_key(), "")?;
+            (owner, tag_json)
         }
     };
 
-    let owner = verify_auth_tag(&tag_json, &bot_keys.public_key())
-        .context("SPROUT_AUTH_TAG is not valid for SPROUT_BOT_PRIVATE_KEY")?;
+    if let Some(explicit_owner) = optional_pubkey_env("LEXEBOT_OWNER_PUBKEY")? {
+        if explicit_owner != owner {
+            bail!(
+                "LEXEBOT_OWNER_PUBKEY {} does not match attested owner {}",
+                explicit_owner.to_hex(),
+                owner.to_hex()
+            );
+        }
+    }
+
     eprintln!("owner-attested auth tag verified; owner={}", owner.to_hex());
-    parse_auth_tag(&tag_json)
+    Ok((owner, Some(parse_auth_tag(&tag_json)?)))
+}
+
+fn owner_pubkey_from_env() -> Result<PublicKey> {
+    if let Some(owner_pubkey) = optional_pubkey_env("LEXEBOT_OWNER_PUBKEY")? {
+        return Ok(owner_pubkey);
+    }
+
+    let owner_keys = Keys::parse(&required_env("SPROUT_OWNER_PRIVATE_KEY")?)
+        .context("SPROUT_OWNER_PRIVATE_KEY must be an nsec or hex private key")?;
+    Ok(owner_keys.public_key())
 }
 
 fn compute_auth_tag(owner_keys: &Keys, bot_pubkey: &PublicKey, conditions: &str) -> Result<String> {

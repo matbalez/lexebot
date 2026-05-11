@@ -5,7 +5,8 @@ control a Lexe wallet from a Sprout channel.
 
 LexeBot is not AI-powered. It holds a Nostr bot key for Sprout messages and a
 Lexe SDK client credential string supplied locally by the user. It only accepts
-commands from `LEXEBOT_OWNER_PUBKEY`.
+wallet commands from the configured owner. In the normal owner-attested setup,
+the owner pubkey is derived from `SPROUT_OWNER_PRIVATE_KEY`.
 
 ## Commands
 
@@ -37,13 +38,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.1-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.1/lexebot-v0.1.1-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.1-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.1/lexebot-v0.1.1-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.1-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.2-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.2/lexebot-v0.1.2-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.2-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.2/lexebot-v0.1.2-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.2-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.1-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.2-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
@@ -66,10 +67,15 @@ SPROUT_CHANNEL_ID=<channel-uuid> \
 SPROUT_BOT_PRIVATE_KEY=<bot-nsec-or-hex-secret> \
 SPROUT_OWNER_PRIVATE_KEY=<your-sprout-owner-or-agent-secret> \
 SPROUT_BOT_AUTH_MODE=owner-attested \
-LEXEBOT_OWNER_PUBKEY=<owner-pubkey-hex> \
 LEXE_CLIENT_CREDENTIALS=<lexe-client-credentials> \
 cargo +1.90.0 run --manifest-path /Users/mattyb/.sprout/REPOS/lexebot/Cargo.toml
 ```
+
+With `SPROUT_BOT_AUTH_MODE=owner-attested`, LexeBot derives the owner pubkey
+from `SPROUT_OWNER_PRIVATE_KEY`. `LEXEBOT_OWNER_PUBKEY` is optional in this
+mode and is only used as a consistency check if supplied. If you use a
+precomputed `SPROUT_AUTH_TAG` without `SPROUT_OWNER_PRIVATE_KEY`, LexeBot
+derives the owner from that verified auth tag instead.
 
 Optional:
 
@@ -143,7 +149,9 @@ cargo run -p sprout-cli -- \
 ## Safety Model
 
 - The bot only responds when the event has a `p` tag for the LexeBot pubkey.
-- The bot only executes commands from `LEXEBOT_OWNER_PUBKEY`.
+- The bot only executes commands from the configured owner pubkey. In
+  owner-attested mode this is derived from `SPROUT_OWNER_PRIVATE_KEY` or
+  verified `SPROUT_AUTH_TAG`; explicit `LEXEBOT_OWNER_PUBKEY` is optional.
 - The bot ignores its own messages and messages from before startup.
 - Relay disconnects are retried with bounded backoff.
 - Lexe client credentials are read from the local environment and never posted
@@ -166,7 +174,7 @@ cargo +1.90.0 install --git https://github.com/<owner>/lexebot --locked
 The next packaging step should be a small `lexebot init` flow that:
 
 - generates a Sprout bot key
-- asks for the owner's Sprout pubkey
+- derives the owner's Sprout pubkey from the owner auth material
 - writes a local `.env` file outside the repo
 - prints the exact `sprout add-channel-member` command for the bot pubkey
 - never stores or uploads Lexe client credentials anywhere except the user's
