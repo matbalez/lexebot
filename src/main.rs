@@ -463,7 +463,7 @@ fn owner_display_name_from_metadata(content: &str) -> Option<String> {
 
 fn owner_lexebot_display_name(owner_name: &str) -> String {
     clean_display_name(owner_name)
-        .map(|name| format!("{name}'s LexeBot"))
+        .map(|name| format!("LexeBot[{}]", name.replace(' ', "")))
         .unwrap_or_else(|| BOT_DISPLAY_NAME.to_string())
 }
 
@@ -728,7 +728,7 @@ fn parse_auto_kudos_command(tokens: &[&str]) -> std::result::Result<BotCommand, 
 }
 
 fn command_help() -> String {
-    "use `@LexeBot get balance`, `@LexeBot get BOLT12`, `@LexeBot create invoice for ₿1,000`, or `@LexeBot send ₿500 to <payment-target>`; personalized names like `@Mat's LexeBot` work too".to_string()
+    "use `@LexeBot get balance`, `@LexeBot get BOLT12`, `@LexeBot create invoice for ₿1,000`, or `@LexeBot send ₿500 to <payment-target>`; personalized names like `@LexeBot[Mat]` work too".to_string()
 }
 
 fn parse_amount_token(token: &str) -> std::result::Result<u64, String> {
@@ -767,9 +767,11 @@ fn format_amount(amount: u64) -> String {
 fn is_bot_mention_token(token: &str) -> bool {
     let normalized = token
         .trim_start_matches('@')
-        .trim_end_matches(|ch: char| ch.is_ascii_punctuation())
+        .trim_end_matches(|ch: char| matches!(ch, ',' | '.' | '!' | '?' | ':' | ';'))
         .to_ascii_lowercase();
-    normalized == BOT_NAME || normalized == "lexe-bot"
+    normalized == BOT_NAME
+        || normalized == "lexe-bot"
+        || (normalized.starts_with("lexebot[") && normalized.ends_with(']'))
 }
 
 fn event_mentions_bot(event: &Event, config: &Config) -> bool {
@@ -1100,6 +1102,10 @@ mod tests {
             parse_command("@Mat's LexeBot get balance"),
             Ok(BotCommand::GetBalance)
         );
+        assert_eq!(
+            parse_command("@LexeBot[Mat] get balance"),
+            Ok(BotCommand::GetBalance)
+        );
     }
 
     #[test]
@@ -1264,10 +1270,10 @@ mod tests {
 
     #[test]
     fn owner_lexebot_display_name_uses_owner_profile_name() {
-        assert_eq!(owner_lexebot_display_name("Mat"), "Mat's LexeBot");
+        assert_eq!(owner_lexebot_display_name("Mat"), "LexeBot[Mat]");
         assert_eq!(
             owner_lexebot_display_name("  Mat   Balez  "),
-            "Mat Balez's LexeBot"
+            "LexeBot[MatBalez]"
         );
         assert_eq!(owner_lexebot_display_name(" \n\t "), "LexeBot");
     }

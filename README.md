@@ -12,8 +12,8 @@ the owner pubkey is derived from `SPROUT_OWNER_PRIVATE_KEY`.
 
 Commands require an explicit mention tag for the bot pubkey. In Sprout, select
 LexeBot from mention autocomplete. If the bot profile is personalized, the
-visible mention can include the owner display name, for example
-`@Mat's LexeBot get balance`.
+visible mention includes the owner display name without spaces, for example
+`@LexeBot[Mat] get balance`.
 
 ```text
 @LexeBot get balance
@@ -38,13 +38,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.2-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.2/lexebot-v0.1.2-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.2-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.2/lexebot-v0.1.2-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.2-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.3-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.3/lexebot-v0.1.3-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.3-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.3/lexebot-v0.1.3-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.3-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.2-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.3-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
@@ -108,9 +108,9 @@ LEXEBOT_KUDOS_BOT_PUBKEY=<kudos-bot-pubkey-hex>
 above that amount are rejected.
 
 On startup, LexeBot tries to read the owner's Sprout/Nostr profile and publishes
-its bot profile as `<owner display name>'s LexeBot`, for example
-`Mat's LexeBot`. Set `LEXEBOT_OWNER_DISPLAY_NAME` only as an optional override
-or fallback if profile lookup is unavailable.
+its bot profile as `LexeBot[<owner display name without spaces>]`, for example
+`LexeBot[Mat]`. Set `LEXEBOT_OWNER_DISPLAY_NAME` only as an optional override or
+fallback if profile lookup is unavailable.
 
 The published profile also includes a public `lexebot` discovery object:
 

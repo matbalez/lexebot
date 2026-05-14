@@ -4,7 +4,7 @@ set -euo pipefail
 CHANNEL_ID="1df37399-3c25-4019-8bc7-faacd53587d0"
 RELAY_WS_URL="wss://sprout.up.railway.app"
 RELAY_HTTP_URL="https://sprout.up.railway.app"
-LEXEBOT_VERSION="v0.1.2"
+LEXEBOT_VERSION="v0.1.3"
 LEXEBOT_ARCHIVE="lexebot-${LEXEBOT_VERSION}-aarch64-apple-darwin.tar.gz"
 LEXEBOT_RELEASE_BASE="https://github.com/matbalez/lexebot/releases/download/${LEXEBOT_VERSION}"
 RUNNER_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/run-flint-alpha.sh"
@@ -17,6 +17,7 @@ CONFIG_FILE="${CONFIG_DIR}/flint-alpha.env"
 SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/xyz.block.sprout.app/identity.key"
 LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/identity.key"
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
+SPROUT_CLI_PATH="${SPROUT_CLI_PATH:-}"
 LEXEBOT_DOWNLOAD_TMPDIR=""
 
 cleanup() {
@@ -64,6 +65,94 @@ find_owner_key_file() {
     return 0
   fi
   return 1
+}
+
+is_sprout_cli() {
+  local candidate="$1"
+  [ -n "$candidate" ] || return 1
+  [ -x "$candidate" ] || return 1
+  "$candidate" --help 2>/dev/null | grep -q "Sprout CLI"
+}
+
+find_sprout_cli() {
+  local candidate resolved seen search_dir
+  seen="|"
+
+  if [ -n "$SPROUT_CLI_PATH" ] && is_sprout_cli "$SPROUT_CLI_PATH"; then
+    printf '%s\n' "$SPROUT_CLI_PATH"
+    return 0
+  fi
+
+  resolved="$(command -v sprout 2>/dev/null || true)"
+  if [ -n "$resolved" ] && is_sprout_cli "$resolved"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  for candidate in \
+    "${HOME}/.local/bin/sprout" \
+    "${HOME}/.cargo/bin/sprout" \
+    "/opt/homebrew/bin/sprout" \
+    "/usr/local/bin/sprout" \
+    "${HOME}/.sprout/REPOS/sprout/target/release/sprout" \
+    "${HOME}/.sprout/REPOS/sprout/target/debug/sprout" \
+    "${SPROUT_REPO_DIR}/target/release/sprout" \
+    "${SPROUT_REPO_DIR}/target/debug/sprout"
+  do
+    case "$seen" in
+      *"|${candidate}|"*) continue ;;
+    esac
+    seen="${seen}${candidate}|"
+    if is_sprout_cli "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  for search_dir in "${HOME}/.sprout" "${HOME}/.cache/lexebot" "${HOME}/.cache"; do
+    [ -d "$search_dir" ] || continue
+    while IFS= read -r candidate; do
+      case "$seen" in
+        *"|${candidate}|"*) continue ;;
+      esac
+      seen="${seen}${candidate}|"
+      if is_sprout_cli "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done <<EOF
+$(find "$search_dir" -maxdepth 8 -type f -name sprout 2>/dev/null)
+EOF
+  done
+
+  return 1
+}
+
+ensure_sprout_cli() {
+  local sprout_cli
+
+  say "Searching for an existing Sprout CLI..."
+  if sprout_cli="$(find_sprout_cli)"; then
+    say "Using Sprout CLI at ${sprout_cli}"
+    printf '%s\n' "$sprout_cli"
+    return 0
+  fi
+
+  need_cmd cargo
+  need_cmd git
+  say "No existing Sprout CLI was found. Building installer-managed Sprout CLI as a last resort."
+  mkdir -p "$(dirname "$SPROUT_REPO_DIR")"
+  if [ ! -d "$SPROUT_REPO_DIR/.git" ]; then
+    git clone --depth 1 https://github.com/block/sprout.git "$SPROUT_REPO_DIR"
+  fi
+  (
+    cd "$SPROUT_REPO_DIR"
+    cargo build -q -p sprout-cli
+  )
+
+  sprout_cli="${SPROUT_REPO_DIR}/target/debug/sprout"
+  is_sprout_cli "$sprout_cli" || fail "built Sprout CLI, but ${sprout_cli} is not executable"
+  printf '%s\n' "$sprout_cli"
 }
 
 download_lexebot() {
@@ -173,10 +262,40 @@ read_lexe_credentials() {
   printf '%s\n' "$creds"
 }
 
+read_owner_display_name() {
+  local default_name owner_name
+
+  if [ -n "${LEXEBOT_OWNER_DISPLAY_NAME:-}" ]; then
+    owner_name="$(printf '%s' "$LEXEBOT_OWNER_DISPLAY_NAME" | trim)"
+    [ -n "$owner_name" ] || fail "LEXEBOT_OWNER_DISPLAY_NAME cannot be empty"
+    printf '%s\n' "$owner_name"
+    return 0
+  fi
+
+  default_name="$(id -un 2>/dev/null || printf 'owner')"
+  say "LexeBot will publish a bot profile named LexeBot[USERNAME]."
+  printf 'USERNAME [%s]: ' "$default_name" >&2
+  IFS= read -r owner_name
+  owner_name="$(printf '%s' "$owner_name" | trim)"
+  [ -n "$owner_name" ] || owner_name="$default_name"
+  printf '%s\n' "$owner_name"
+}
+
+bot_display_name() {
+  local owner_name="$1" compact
+  compact="$(printf '%s' "$owner_name" | LC_ALL=C tr -d '[:space:][:cntrl:]' | cut -c 1-80)"
+  if [ -n "$compact" ]; then
+    printf 'LexeBot[%s]\n' "$compact"
+  else
+    printf 'LexeBot\n'
+  fi
+}
+
 write_config() {
   local owner_key="$1"
   local bot_nsec="$2"
-  local lexe_credentials="$3"
+  local owner_display_name="$3"
+  local lexe_credentials="$4"
 
   mkdir -p "$CONFIG_DIR"
   umask 077
@@ -187,6 +306,7 @@ write_config() {
     printf 'SPROUT_OWNER_PRIVATE_KEY=%s\n' "$(shell_quote "$owner_key")"
     printf 'SPROUT_BOT_PRIVATE_KEY=%s\n' "$(shell_quote "$bot_nsec")"
     printf 'SPROUT_BOT_AUTH_MODE=%s\n' "$(shell_quote "owner-attested")"
+    printf 'LEXEBOT_OWNER_DISPLAY_NAME=%s\n' "$(shell_quote "$owner_display_name")"
     printf 'LEXE_CLIENT_CREDENTIALS=%s\n' "$(shell_quote "$lexe_credentials")"
     printf 'LEXEBOT_BIN=%s\n' "$(shell_quote "$LEXEBOT_BIN")"
     printf 'LEXEBOT_VERSION=%s\n' "$(shell_quote "$LEXEBOT_VERSION")"
@@ -195,13 +315,41 @@ write_config() {
   say "Wrote ${CONFIG_FILE}"
 }
 
-add_bot_to_channel() {
-  local owner_key="$1"
-  local bot_pubkey="$2"
+sprout_set_profile() {
+  local sprout_cli="$1"
+  local bot_nsec="$2"
+  local display_name="$3"
+
+  say "Publishing LexeBot profile as ${display_name}..."
+  if "$sprout_cli" users set-profile --help >/dev/null 2>&1; then
+    SPROUT_PRIVATE_KEY="$bot_nsec" "$sprout_cli" \
+      --relay "$RELAY_HTTP_URL" \
+      users set-profile \
+      --name "$display_name" \
+      --about "Local Lexe wallet bot for Sprout"
+    return 0
+  fi
+
+  if "$sprout_cli" set-profile --help >/dev/null 2>&1; then
+    SPROUT_PRIVATE_KEY="$bot_nsec" "$sprout_cli" \
+      --relay "$RELAY_HTTP_URL" \
+      set-profile \
+      --name "$display_name" \
+      --about "Local Lexe wallet bot for Sprout"
+    return 0
+  fi
+
+  fail "Sprout CLI at ${sprout_cli} does not support profile publishing"
+}
+
+sprout_add_bot_to_channel() {
+  local sprout_cli="$1"
+  local owner_key="$2"
+  local bot_pubkey="$3"
 
   say "Adding LexeBot to Flint Alpha as role bot..."
-  if command -v sprout >/dev/null 2>&1; then
-    SPROUT_PRIVATE_KEY="$owner_key" sprout \
+  if "$sprout_cli" channels add-member --help >/dev/null 2>&1; then
+    SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
       --relay "$RELAY_HTTP_URL" \
       channels add-member \
       --channel "$CHANNEL_ID" \
@@ -211,26 +359,18 @@ add_bot_to_channel() {
     return 0
   fi
 
-  if command -v cargo >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
-    say "sprout CLI was not found. Falling back to cargo + github.com/block/sprout."
-    mkdir -p "$(dirname "$SPROUT_REPO_DIR")"
-    if [ ! -d "$SPROUT_REPO_DIR/.git" ]; then
-      git clone --depth 1 https://github.com/block/sprout.git "$SPROUT_REPO_DIR"
-    fi
-    (
-      cd "$SPROUT_REPO_DIR"
-      SPROUT_PRIVATE_KEY="$owner_key" cargo run -q -p sprout-cli -- \
-        --relay "$RELAY_HTTP_URL" \
-        channels add-member \
-        --channel "$CHANNEL_ID" \
-        --pubkey "$bot_pubkey" \
-        --role bot
-    )
+  if "$sprout_cli" add-channel-member --help >/dev/null 2>&1; then
+    SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
+      --relay "$RELAY_HTTP_URL" \
+      add-channel-member \
+      --channel "$CHANNEL_ID" \
+      --pubkey "$bot_pubkey" \
+      --role bot
     say "LexeBot was added to Flint Alpha."
     return 0
   fi
 
-  fail "install sprout CLI, or install cargo+git so the installer can build sprout-cli automatically"
+  fail "Sprout CLI at ${sprout_cli} does not support adding channel members"
 }
 
 main() {
@@ -241,6 +381,7 @@ main() {
   install_runner
 
   local owner_key_file owner_key bot_pubkey bot_nsec lexe_credentials generated
+  local owner_display_name display_name sprout_cli
   owner_key_file="$(find_owner_key_file)" || fail "Sprout identity key not found. Launch Sprout once, then rerun this installer."
   owner_key="$(read_secret_file "$owner_key_file")" || fail "could not read ${owner_key_file}"
   [ -n "$owner_key" ] || fail "Sprout identity key is empty"
@@ -249,9 +390,13 @@ main() {
   bot_pubkey="$(printf '%s\n' "$generated" | sed -n '1p')"
   bot_nsec="$(printf '%s\n' "$generated" | sed -n '2p')"
   lexe_credentials="$(read_lexe_credentials)"
+  owner_display_name="$(read_owner_display_name)"
+  display_name="$(bot_display_name "$owner_display_name")"
+  sprout_cli="$(ensure_sprout_cli)"
 
-  write_config "$owner_key" "$bot_nsec" "$lexe_credentials"
-  add_bot_to_channel "$owner_key" "$bot_pubkey"
+  sprout_set_profile "$sprout_cli" "$bot_nsec" "$display_name"
+  write_config "$owner_key" "$bot_nsec" "$owner_display_name" "$lexe_credentials"
+  sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey"
 
   say
   say "Done. Start LexeBot with:"
