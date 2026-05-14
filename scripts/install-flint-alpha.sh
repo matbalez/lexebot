@@ -117,12 +117,14 @@ generate_bot_identity() {
 }
 
 read_lexe_credentials() {
-  local creds
-  say "Paste your Lexe SDK client credentials, then press Return."
-  say "Input is visible so long client strings paste normally."
-  printf 'Lexe SDK client: ' >&2
-  IFS= read -r creds
-  creds="$(printf '%s' "$creds" | trim)"
+  local creds ready
+  need_cmd pbpaste
+
+  say "Copy your Lexe SDK client credentials to the clipboard, then press Return."
+  say "The installer reads it with pbpaste so long client strings do not go through Terminal input."
+  printf 'Press Return when ready: ' >&2
+  IFS= read -r ready
+  creds="$(pbpaste | LC_ALL=C tr -d '\r')"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
   printf '%s\n' "$creds"
 }
