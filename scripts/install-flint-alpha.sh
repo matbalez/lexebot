@@ -17,6 +17,15 @@ CONFIG_FILE="${CONFIG_DIR}/flint-alpha.env"
 SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/xyz.block.sprout.app/identity.key"
 LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/identity.key"
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
+LEXEBOT_DOWNLOAD_TMPDIR=""
+
+cleanup() {
+  if [ -n "${LEXEBOT_DOWNLOAD_TMPDIR:-}" ] && [ -d "$LEXEBOT_DOWNLOAD_TMPDIR" ]; then
+    rm -rf "$LEXEBOT_DOWNLOAD_TMPDIR"
+  fi
+}
+
+trap cleanup EXIT
 
 say() {
   printf '%s\n' "$*" >&2
@@ -67,7 +76,7 @@ download_lexebot() {
 
   local tmpdir
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
+  LEXEBOT_DOWNLOAD_TMPDIR="$tmpdir"
 
   say "Downloading LexeBot ${LEXEBOT_VERSION}..."
   curl -fL -o "${tmpdir}/${LEXEBOT_ARCHIVE}" "${LEXEBOT_RELEASE_BASE}/${LEXEBOT_ARCHIVE}"
@@ -117,14 +126,36 @@ generate_bot_identity() {
 }
 
 read_lexe_credentials() {
-  local creds ready
-  need_cmd pbpaste
+  local creds extra stty_state
 
-  say "Copy your Lexe SDK client credentials to the clipboard, then press Return."
-  say "The installer reads it with pbpaste so long client strings do not go through Terminal input."
-  printf 'Press Return when ready: ' >&2
-  IFS= read -r ready
-  creds="$(pbpaste | LC_ALL=C tr -d '\r')"
+  if [ -n "${LEXE_CLIENT_CREDENTIALS:-}" ]; then
+    creds="$(printf '%s' "$LEXE_CLIENT_CREDENTIALS" | LC_ALL=C tr -d '\r' | trim)"
+    [ -n "$creds" ] || fail "LEXE_CLIENT_CREDENTIALS cannot be empty"
+    say "Read Lexe SDK client credentials from LEXE_CLIENT_CREDENTIALS."
+    printf '%s\n' "$creds"
+    return 0
+  fi
+
+  say "Paste your Lexe SDK client credentials, then press Return."
+  say "Input is visible so long client strings paste normally."
+  printf 'Lexe SDK client: ' >&2
+  if [ -t 0 ]; then
+    stty_state="$(stty -g 2>/dev/null || true)"
+    stty -ixon 2>/dev/null || true
+  fi
+  if ! IFS= read -r creds; then
+    if [ -n "${stty_state:-}" ]; then
+      stty "$stty_state" 2>/dev/null || true
+    fi
+    fail "could not read Lexe SDK client credentials"
+  fi
+  while IFS= read -r -t 1 extra; do
+    creds="${creds}${extra}"
+  done
+  if [ -n "${stty_state:-}" ]; then
+    stty "$stty_state" 2>/dev/null || true
+  fi
+  creds="$(printf '%s' "$creds" | LC_ALL=C tr -d '\r' | trim)"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
   printf '%s\n' "$creds"
 }
@@ -159,7 +190,7 @@ add_bot_to_channel() {
   if command -v sprout >/dev/null 2>&1; then
     SPROUT_PRIVATE_KEY="$owner_key" sprout \
       --relay "$RELAY_HTTP_URL" \
-      add-channel-member \
+      channels add-member \
       --channel "$CHANNEL_ID" \
       --pubkey "$bot_pubkey" \
       --role bot
@@ -177,7 +208,7 @@ add_bot_to_channel() {
       cd "$SPROUT_REPO_DIR"
       SPROUT_PRIVATE_KEY="$owner_key" cargo run -q -p sprout-cli -- \
         --relay "$RELAY_HTTP_URL" \
-        add-channel-member \
+        channels add-member \
         --channel "$CHANNEL_ID" \
         --pubkey "$bot_pubkey" \
         --role bot
