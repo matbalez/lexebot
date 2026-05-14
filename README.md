@@ -63,10 +63,10 @@ run-lexebot-flint-alpha
 
 The installer downloads the binary, generates a local LexeBot identity, reads
 the local Sprout owner key from `~/Library/Application Support/xyz.block.sprout.app/identity.key`,
-stores the bot key and Lexe SDK client credentials in macOS Keychain, writes
-`~/.config/lexebot/flint-alpha.env`, installs the runner at
-`~/.local/bin/run-lexebot-flint-alpha`, and tries to add the bot to Flint
-Alpha.
+asks only for the Lexe SDK client credentials, stores the local run config in
+`~/.config/lexebot/flint-alpha.env` with file mode `600`, installs the runner
+at `~/.local/bin/run-lexebot-flint-alpha`, and adds the bot to Flint Alpha as
+role `bot` using the invoking user's admin identity.
 
 ### From Source
 
