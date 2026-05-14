@@ -118,10 +118,10 @@ generate_bot_identity() {
 
 read_lexe_credentials() {
   local creds
-  say "Paste your Lexe SDK client credentials. Input is hidden."
+  say "Paste your Lexe SDK client credentials, then press Return."
+  say "Input is visible so long client strings paste normally."
   printf 'Lexe SDK client: ' >&2
-  IFS= read -r -s creds
-  printf '\n' >&2
+  IFS= read -r creds
   creds="$(printf '%s' "$creds" | trim)"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
   printf '%s\n' "$creds"
