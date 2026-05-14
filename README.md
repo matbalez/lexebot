@@ -51,6 +51,23 @@ chmod 700 ~/.local/bin/lexebot
 
 Make sure `~/.local/bin` is on your `PATH`.
 
+### Flint Alpha Scripts
+
+For Flint Alpha users on Apple Silicon Macs, the repo includes two wrapper
+scripts:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install-flint-alpha.sh)
+run-lexebot-flint-alpha
+```
+
+The installer downloads the binary, generates a local LexeBot identity, reads
+the local Sprout owner key from `~/Library/Application Support/xyz.block.sprout.app/identity.key`,
+stores the bot key and Lexe SDK client credentials in macOS Keychain, writes
+`~/.config/lexebot/flint-alpha.env`, installs the runner at
+`~/.local/bin/run-lexebot-flint-alpha`, and tries to add the bot to Flint
+Alpha.
+
 ### From Source
 
 Generate a bot identity:
