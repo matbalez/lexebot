@@ -126,7 +126,7 @@ generate_bot_identity() {
 }
 
 read_lexe_credentials() {
-  local creds extra stty_state
+  local char creds read_any stty_state
 
   if [ -n "${LEXE_CLIENT_CREDENTIALS:-}" ]; then
     creds="$(printf '%s' "$LEXE_CLIENT_CREDENTIALS" | LC_ALL=C tr -d '\r' | trim)"
@@ -141,19 +141,32 @@ read_lexe_credentials() {
   printf 'Lexe SDK client: ' >&2
   if [ -t 0 ]; then
     stty_state="$(stty -g 2>/dev/null || true)"
-    stty -ixon 2>/dev/null || true
+    stty -icanon -ixon min 1 time 0 2>/dev/null || true
   fi
-  if ! IFS= read -r creds; then
-    if [ -n "${stty_state:-}" ]; then
-      stty "$stty_state" 2>/dev/null || true
-    fi
-    fail "could not read Lexe SDK client credentials"
-  fi
-  while IFS= read -r -t 1 extra; do
-    creds="${creds}${extra}"
+
+  creds=""
+  read_any=0
+  while IFS= read -r -n 1 char; do
+    read_any=1
+    case "$char" in
+      ""|$'\n'|$'\r')
+        break
+        ;;
+      *)
+        creds="${creds}${char}"
+        ;;
+    esac
   done
   if [ -n "${stty_state:-}" ]; then
     stty "$stty_state" 2>/dev/null || true
+  fi
+  if [ "$read_any" -eq 0 ]; then
+    fail "could not read Lexe SDK client credentials"
+  fi
+  if [ -n "${char:-}" ] && [ "$char" != $'\n' ] && [ "$char" != $'\r' ]; then
+    if [ -t 0 ]; then
+      printf '\n' >&2
+    fi
   fi
   creds="$(printf '%s' "$creds" | LC_ALL=C tr -d '\r' | trim)"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
