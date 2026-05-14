@@ -14,7 +14,6 @@ LEXEBOT_BIN="${INSTALL_DIR}/lexebot"
 RUNNER_BIN="${INSTALL_DIR}/run-lexebot-flint-alpha"
 CONFIG_DIR="${HOME}/.config/lexebot"
 CONFIG_FILE="${CONFIG_DIR}/flint-alpha.env"
-KEYCHAIN_SERVICE="xyz.block.sprout.lexebot.flint-alpha"
 SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/xyz.block.sprout.app/identity.key"
 LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/identity.key"
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
@@ -36,14 +35,8 @@ trim() {
   awk '{$1=$1; print}'
 }
 
-keychain_get() {
-  security find-generic-password -a "$1" -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true
-}
-
-keychain_set() {
-  local account="$1"
-  local value="$2"
-  security add-generic-password -U -a "$account" -s "$KEYCHAIN_SERVICE" -w "$value" >/dev/null
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\''/g")"
 }
 
 read_secret_file() {
@@ -109,16 +102,8 @@ install_runner() {
   say "Installed runner ${RUNNER_BIN}"
 }
 
-ensure_bot_identity() {
-  local existing_nsec existing_pubkey key_output bot_nsec bot_pubkey
-  existing_nsec="$(keychain_get bot-nsec)"
-  existing_pubkey="$(keychain_get bot-pubkey-hex)"
-
-  if [ -n "$existing_nsec" ] && [ -n "$existing_pubkey" ]; then
-    say "Using existing local LexeBot identity from Keychain."
-    printf '%s\n' "$existing_pubkey"
-    return 0
-  fi
+generate_bot_identity() {
+  local key_output bot_nsec bot_pubkey
 
   say "Creating a local LexeBot identity..."
   key_output="$("$LEXEBOT_BIN" --generate-key)"
@@ -128,53 +113,38 @@ ensure_bot_identity() {
   [ -n "$bot_pubkey" ] || fail "could not parse generated LexeBot public key"
   [ -n "$bot_nsec" ] || fail "could not parse generated LexeBot private key"
 
-  keychain_set bot-nsec "$bot_nsec"
-  keychain_set bot-pubkey-hex "$bot_pubkey"
-  say "Stored LexeBot identity in macOS Keychain."
-  printf '%s\n' "$bot_pubkey"
+  printf '%s\n%s\n' "$bot_pubkey" "$bot_nsec"
 }
 
-ensure_lexe_credentials() {
-  local existing answer creds
-  existing="$(keychain_get lexe-client-credentials)"
-
-  if [ -n "$existing" ]; then
-    printf 'Lexe SDK client credentials already exist in Keychain. Replace them? [y/N] '
-    read -r answer
-    case "$answer" in
-      y|Y|yes|YES) ;;
-      *)
-        say "Keeping existing Lexe SDK client credentials."
-        return 0
-        ;;
-    esac
-  fi
-
+read_lexe_credentials() {
+  local creds
   say "Paste your Lexe SDK client credentials. Input is hidden."
   printf 'Lexe SDK client: '
   IFS= read -r -s creds
   printf '\n'
   creds="$(printf '%s' "$creds" | trim)"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
-
-  keychain_set lexe-client-credentials "$creds"
-  say "Stored Lexe SDK client credentials in macOS Keychain."
+  printf '%s\n' "$creds"
 }
 
 write_config() {
-  local owner_key_file="$1"
+  local owner_key="$1"
+  local bot_nsec="$2"
+  local lexe_credentials="$3"
 
   mkdir -p "$CONFIG_DIR"
   umask 077
-  cat >"$CONFIG_FILE" <<EOF
-SPROUT_RELAY_URL='${RELAY_WS_URL}'
-SPROUT_HTTP_RELAY_URL='${RELAY_HTTP_URL}'
-SPROUT_CHANNEL_ID='${CHANNEL_ID}'
-SPROUT_OWNER_PRIVATE_KEY_FILE='${owner_key_file}'
-LEXEBOT_BIN='${LEXEBOT_BIN}'
-LEXEBOT_VERSION='${LEXEBOT_VERSION}'
-KEYCHAIN_SERVICE='${KEYCHAIN_SERVICE}'
-EOF
+  {
+    printf 'SPROUT_RELAY_URL=%s\n' "$(shell_quote "$RELAY_WS_URL")"
+    printf 'SPROUT_HTTP_RELAY_URL=%s\n' "$(shell_quote "$RELAY_HTTP_URL")"
+    printf 'SPROUT_CHANNEL_ID=%s\n' "$(shell_quote "$CHANNEL_ID")"
+    printf 'SPROUT_OWNER_PRIVATE_KEY=%s\n' "$(shell_quote "$owner_key")"
+    printf 'SPROUT_BOT_PRIVATE_KEY=%s\n' "$(shell_quote "$bot_nsec")"
+    printf 'SPROUT_BOT_AUTH_MODE=%s\n' "$(shell_quote "owner-attested")"
+    printf 'LEXE_CLIENT_CREDENTIALS=%s\n' "$(shell_quote "$lexe_credentials")"
+    printf 'LEXEBOT_BIN=%s\n' "$(shell_quote "$LEXEBOT_BIN")"
+    printf 'LEXEBOT_VERSION=%s\n' "$(shell_quote "$LEXEBOT_VERSION")"
+  } >"$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
   say "Wrote ${CONFIG_FILE}"
 }
@@ -183,18 +153,16 @@ add_bot_to_channel() {
   local owner_key="$1"
   local bot_pubkey="$2"
 
-  say "Adding LexeBot to Flint Alpha..."
+  say "Adding LexeBot to Flint Alpha as role bot..."
   if command -v sprout >/dev/null 2>&1; then
-    if SPROUT_PRIVATE_KEY="$owner_key" sprout \
+    SPROUT_PRIVATE_KEY="$owner_key" sprout \
       --relay "$RELAY_HTTP_URL" \
       add-channel-member \
       --channel "$CHANNEL_ID" \
       --pubkey "$bot_pubkey" \
-      --role bot; then
-      say "LexeBot was added to Flint Alpha."
-      return 0
-    fi
-    say "Installed sprout CLI failed; trying fallback if available."
+      --role bot
+    say "LexeBot was added to Flint Alpha."
+    return 0
   fi
 
   if command -v cargo >/dev/null 2>&1 && command -v git >/dev/null 2>&1; then
@@ -203,7 +171,7 @@ add_bot_to_channel() {
     if [ ! -d "$SPROUT_REPO_DIR/.git" ]; then
       git clone --depth 1 https://github.com/block/sprout.git "$SPROUT_REPO_DIR"
     fi
-    if (
+    (
       cd "$SPROUT_REPO_DIR"
       SPROUT_PRIVATE_KEY="$owner_key" cargo run -q -p sprout-cli -- \
         --relay "$RELAY_HTTP_URL" \
@@ -211,34 +179,32 @@ add_bot_to_channel() {
         --channel "$CHANNEL_ID" \
         --pubkey "$bot_pubkey" \
         --role bot
-    ); then
-      say "LexeBot was added to Flint Alpha."
-      return 0
-    fi
-    say "Cargo fallback failed."
-    return 1
+    )
+    say "LexeBot was added to Flint Alpha."
+    return 0
   fi
 
-  say "Could not auto-add the bot because neither sprout CLI nor cargo+git is available."
-  say "Install finished, but a channel admin still needs to add this bot pubkey as role bot:"
-  say "$bot_pubkey"
+  fail "install sprout CLI, or install cargo+git so the installer can build sprout-cli automatically"
 }
 
 main() {
   need_cmd awk
-  need_cmd security
+  need_cmd sed
 
   download_lexebot
   install_runner
 
-  local owner_key_file owner_key bot_pubkey
+  local owner_key_file owner_key bot_pubkey bot_nsec lexe_credentials generated
   owner_key_file="$(find_owner_key_file)" || fail "Sprout identity key not found. Launch Sprout once, then rerun this installer."
   owner_key="$(read_secret_file "$owner_key_file")" || fail "could not read ${owner_key_file}"
   [ -n "$owner_key" ] || fail "Sprout identity key is empty"
 
-  bot_pubkey="$(ensure_bot_identity | tail -n 1)"
-  ensure_lexe_credentials
-  write_config "$owner_key_file"
+  generated="$(generate_bot_identity)"
+  bot_pubkey="$(printf '%s\n' "$generated" | sed -n '1p')"
+  bot_nsec="$(printf '%s\n' "$generated" | sed -n '2p')"
+  lexe_credentials="$(read_lexe_credentials)"
+
+  write_config "$owner_key" "$bot_nsec" "$lexe_credentials"
   add_bot_to_channel "$owner_key" "$bot_pubkey"
 
   say
