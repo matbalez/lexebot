@@ -19,7 +19,7 @@ LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
 
 say() {
-  printf '%s\n' "$*"
+  printf '%s\n' "$*" >&2
 }
 
 fail() {
@@ -119,9 +119,9 @@ generate_bot_identity() {
 read_lexe_credentials() {
   local creds
   say "Paste your Lexe SDK client credentials. Input is hidden."
-  printf 'Lexe SDK client: '
+  printf 'Lexe SDK client: ' >&2
   IFS= read -r -s creds
-  printf '\n'
+  printf '\n' >&2
   creds="$(printf '%s' "$creds" | trim)"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
   printf '%s\n' "$creds"
