@@ -314,52 +314,47 @@ generate_bot_identity() {
   printf '%s\n%s\n' "$bot_pubkey" "$bot_nsec"
 }
 
+normalize_lexe_credentials() {
+  local creds="$1"
+  creds="${creds//$'\e[200~'/}"
+  creds="${creds//$'\e[201~'/}"
+  printf '%s' "$creds" | LC_ALL=C tr -d '\r\n' | trim
+}
+
 read_lexe_credentials() {
-  local char creds read_any stty_state
+  local creds path ready
 
   if [ -n "${LEXE_CLIENT_CREDENTIALS:-}" ]; then
-    creds="$(printf '%s' "$LEXE_CLIENT_CREDENTIALS" | LC_ALL=C tr -d '\r' | trim)"
+    creds="$(normalize_lexe_credentials "$LEXE_CLIENT_CREDENTIALS")"
     [ -n "$creds" ] || fail "LEXE_CLIENT_CREDENTIALS cannot be empty"
     say "Read Lexe SDK client credentials from LEXE_CLIENT_CREDENTIALS."
     printf '%s\n' "$creds"
     return 0
   fi
 
-  say "Paste your Lexe SDK client credentials, then press Return."
-  say "The credential will not be echoed; a character count is printed after capture."
-  printf 'Lexe SDK client: ' >&2
-  if [ -t 0 ]; then
-    stty_state="$(stty -g 2>/dev/null || true)"
-    stty -icanon -ixon -echo min 1 time 0 2>/dev/null || true
+  if command -v pbpaste >/dev/null 2>&1; then
+    say "Copy your Lexe SDK client credentials to the macOS clipboard."
+    say "Do not paste the credential into Terminal; the installer will read it with pbpaste."
+    printf 'Press Return when the credential is on your clipboard: ' >&2
+    IFS= read -r ready || true
+
+    creds="$(normalize_lexe_credentials "$(pbpaste)")"
+    [ -n "$creds" ] || fail "clipboard did not contain Lexe SDK client credentials"
+    say "Read Lexe SDK client credentials from clipboard (${#creds} characters)."
+    printf '%s\n' "$creds"
+    return 0
   fi
 
-  creds=""
-  read_any=0
-  while IFS= read -r -n 1 char; do
-    read_any=1
-    case "$char" in
-      ""|$'\n'|$'\r')
-        break
-        ;;
-      *)
-        creds="${creds}${char}"
-        ;;
-    esac
-  done
-  if [ -n "${stty_state:-}" ]; then
-    stty "$stty_state" 2>/dev/null || true
-  fi
-  if [ "$read_any" -eq 0 ]; then
-    fail "could not read Lexe SDK client credentials"
-  fi
-  if [ -t 0 ]; then
-    printf '\n' >&2
-  fi
-  creds="${creds//$'\e[200~'/}"
-  creds="${creds//$'\e[201~'/}"
-  creds="$(printf '%s' "$creds" | LC_ALL=C tr -d '\r' | trim)"
+  say "pbpaste is not available. Save your Lexe SDK client credentials to a local file."
+  printf 'Credential file path: ' >&2
+  IFS= read -r path || path=""
+  path="$(printf '%s' "$path" | trim)"
+  [ -n "$path" ] || fail "credential file path cannot be empty"
+  [ -f "$path" ] || fail "credential file not found: ${path}"
+
+  creds="$(normalize_lexe_credentials "$(/bin/cat "$path")")"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
-  say "Read Lexe SDK client credentials (${#creds} characters)."
+  say "Read Lexe SDK client credentials from file (${#creds} characters)."
   printf '%s\n' "$creds"
 }
 
