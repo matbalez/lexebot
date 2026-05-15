@@ -42,6 +42,10 @@ async fn main() -> Result<()> {
         print_generated_key()?;
         return Ok(());
     }
+    if std::env::args().any(|arg| arg == "--print-pubkey") {
+        print_configured_pubkey()?;
+        return Ok(());
+    }
 
     let config = Config::from_env()?;
     let lexe = LexeClient::from_env()?;
@@ -231,13 +235,14 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let bot_display_name = resolve_bot_display_name(&mut ws, &runtime.config).await;
     let bolt12_offer = runtime.lexe.create_bolt12_offer().await?;
     publish_profile(&mut ws, &runtime.config, &bot_display_name, &bolt12_offer).await?;
-    subscribe_to_channel(&mut ws, &runtime.config.channel_id).await?;
+    subscribe_to_channels(&mut ws, &runtime.config.channel_ids).await?;
 
     let started_at = nostr::Timestamp::now();
 
     eprintln!(
-        "listening in channel {} for @LexeBot commands",
-        runtime.config.channel_id
+        "listening in {} channel(s) for @LexeBot commands: {}",
+        runtime.config.channel_ids.len(),
+        runtime.config.channel_ids.join(", ")
     );
 
     loop {
@@ -279,9 +284,16 @@ fn print_generated_key() -> Result<()> {
     Ok(())
 }
 
+fn print_configured_pubkey() -> Result<()> {
+    let keys = Keys::parse(&required_env("SPROUT_BOT_PRIVATE_KEY")?)
+        .context("SPROUT_BOT_PRIVATE_KEY must be an nsec or hex private key")?;
+    println!("{}", keys.public_key().to_hex());
+    Ok(())
+}
+
 struct Config {
     relay_url: String,
-    channel_id: String,
+    channel_ids: Vec<String>,
     bot_keys: Keys,
     owner_pubkey: PublicKey,
     owner_display_name_override: Option<String>,
@@ -293,7 +305,7 @@ impl Config {
     fn from_env() -> Result<Self> {
         let relay_url =
             std::env::var("SPROUT_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
-        let channel_id = required_env("SPROUT_CHANNEL_ID")?;
+        let channel_ids = channel_ids_from_env()?;
         let bot_keys = Keys::parse(&required_env("SPROUT_BOT_PRIVATE_KEY")?)
             .context("SPROUT_BOT_PRIVATE_KEY must be an nsec or hex private key")?;
         let owner_display_name_override = std::env::var("LEXEBOT_OWNER_DISPLAY_NAME")
@@ -313,7 +325,7 @@ impl Config {
 
         Ok(Self {
             relay_url,
-            channel_id,
+            channel_ids,
             bot_keys,
             owner_pubkey,
             owner_display_name_override,
@@ -488,12 +500,23 @@ fn auth_tag_json(tag: &Tag) -> Value {
     )
 }
 
+async fn subscribe_to_channels(ws: &mut Ws, channel_ids: &[String]) -> Result<()> {
+    for channel_id in channel_ids {
+        subscribe_to_channel(ws, channel_id).await?;
+    }
+    Ok(())
+}
+
 async fn subscribe_to_channel(ws: &mut Ws, channel_id: &str) -> Result<()> {
     let filter = Filter::new().kind(Kind::Custom(9)).custom_tag(
         SingleLetterTag::lowercase(Alphabet::H),
         [channel_id.to_string()],
     );
-    send_json(ws, json!(["REQ", SUBSCRIPTION_ID, filter])).await
+    send_json(ws, json!(["REQ", subscription_id(channel_id), filter])).await
+}
+
+fn subscription_id(channel_id: &str) -> String {
+    format!("{SUBSCRIPTION_ID}:{channel_id}")
 }
 
 async fn handle_relay_text(
@@ -525,15 +548,22 @@ fn handle_closed(config: &Config, value: &Value) -> Result<()> {
     let reason = value.get(2).and_then(Value::as_str).unwrap_or("");
     eprintln!("relay closed subscription {subscription}: {reason}");
 
-    if subscription == SUBSCRIPTION_ID && reason.contains("not a channel member") {
-        print_membership_help(config, reason);
+    if let Some(channel_id) = subscription.strip_prefix(&format!("{SUBSCRIPTION_ID}:")) {
+        if reason.contains("not a channel member") {
+            print_membership_help(config, channel_id, reason);
+            bail!(
+                "LexeBot is authenticated on the relay but is not a member of channel {channel_id}"
+            );
+        }
+    } else if subscription == SUBSCRIPTION_ID && reason.contains("not a channel member") {
+        print_membership_help(config, "<channel-uuid>", reason);
         bail!("LexeBot is authenticated on the relay but is not a member of this channel");
     }
 
     Ok(())
 }
 
-fn print_membership_help(config: &Config, reason: &str) {
+fn print_membership_help(config: &Config, channel_id: &str, reason: &str) {
     let bot_pubkey = config.bot_keys.public_key().to_hex();
     eprintln!("{reason}");
     eprintln!(
@@ -542,7 +572,7 @@ fn print_membership_help(config: &Config, reason: &str) {
     eprintln!("Add this bot pubkey to the channel, then restart LexeBot:");
     eprintln!("  bot pubkey: {bot_pubkey}");
     eprintln!("  sprout channels add-member \\");
-    eprintln!("    --channel {} \\", config.channel_id);
+    eprintln!("    --channel {channel_id} \\");
     eprintln!("    --pubkey {bot_pubkey} \\");
     eprintln!("    --role bot");
 }
@@ -559,6 +589,9 @@ async fn maybe_reply(
     if !event_mentions_bot(event, &runtime.config) {
         return Ok(());
     }
+    let Some(channel_id) = event_channel_id(event, &runtime.config) else {
+        return Ok(());
+    };
 
     let reply = match parse_command(&event.content) {
         Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => {
@@ -574,12 +607,8 @@ async fn maybe_reply(
         Err(err) => format!("Invalid LexeBot command: {err}"),
     };
 
-    let reply_event = build_message(
-        &runtime.config.channel_id,
-        &reply,
-        &reply_mentions(event, &runtime.config),
-    )?
-    .sign_with_keys(&runtime.config.bot_keys)?;
+    let reply_event = build_message(channel_id, &reply, &reply_mentions(event, &runtime.config))?
+        .sign_with_keys(&runtime.config.bot_keys)?;
     let reply_event_id = reply_event.id.to_hex();
 
     send_json(ws, json!(["EVENT", reply_event])).await?;
@@ -758,6 +787,21 @@ fn event_mentions_bot(event: &Event, config: &Config) -> bool {
         let parts = tag.as_slice();
         parts.first().map(String::as_str) == Some("p")
             && parts.get(1).map(String::as_str) == Some(bot_pubkey.as_str())
+    })
+}
+
+fn event_channel_id<'a>(event: &'a Event, config: &Config) -> Option<&'a str> {
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        if parts.first().map(String::as_str) != Some("h") {
+            return None;
+        }
+        let channel_id = parts.get(1)?.as_str();
+        config
+            .channel_ids
+            .iter()
+            .any(|configured| configured == channel_id)
+            .then_some(channel_id)
     })
 }
 
@@ -1032,6 +1076,29 @@ fn required_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} is required"))
 }
 
+fn channel_ids_from_env() -> Result<Vec<String>> {
+    let value = std::env::var("SPROUT_CHANNEL_IDS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("SPROUT_CHANNEL_ID").ok())
+        .context("SPROUT_CHANNEL_IDS or SPROUT_CHANNEL_ID is required")?;
+    let mut channel_ids = Vec::new();
+
+    for raw in value.split([',', '\n', ' ', '\t']) {
+        let channel_id = raw.trim();
+        if channel_id.is_empty() || channel_ids.iter().any(|existing| existing == channel_id) {
+            continue;
+        }
+        channel_ids.push(channel_id.to_string());
+    }
+
+    if channel_ids.is_empty() {
+        bail!("SPROUT_CHANNEL_IDS must contain at least one channel UUID");
+    }
+
+    Ok(channel_ids)
+}
+
 fn optional_u64_env(name: &str) -> Result<Option<u64>> {
     std::env::var(name)
         .ok()
@@ -1168,7 +1235,7 @@ mod tests {
         .unwrap();
         let config = Config {
             relay_url: DEFAULT_RELAY_URL.to_string(),
-            channel_id: "test-channel".to_string(),
+            channel_ids: vec!["test-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
             owner_display_name_override: None,
@@ -1189,7 +1256,7 @@ mod tests {
             .unwrap();
         let config = Config {
             relay_url: DEFAULT_RELAY_URL.to_string(),
-            channel_id: "test-channel".to_string(),
+            channel_ids: vec!["test-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
             owner_display_name_override: None,
@@ -1201,6 +1268,29 @@ mod tests {
     }
 
     #[test]
+    fn event_channel_must_be_configured() {
+        let owner_keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(9),
+            "@LexeBot get balance",
+            [Tag::parse(&["h", "second-channel"]).unwrap()],
+        )
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["first-channel".to_string(), "second-channel".to_string()],
+            bot_keys: Keys::generate(),
+            owner_pubkey: owner_keys.public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: None,
+        };
+
+        assert_eq!(event_channel_id(&event, &config), Some("second-channel"));
+    }
+
+    #[test]
     fn auto_kudos_requires_configured_kudos_bot_and_owner_sender() {
         let owner_keys = Keys::generate();
         let bot_keys = Keys::generate();
@@ -1208,7 +1298,7 @@ mod tests {
         let receiver = Keys::generate().public_key();
         let config = Config {
             relay_url: DEFAULT_RELAY_URL.to_string(),
-            channel_id: "test-channel".to_string(),
+            channel_ids: vec!["test-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
             owner_display_name_override: None,

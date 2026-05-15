@@ -1,7 +1,7 @@
 # LexeBot
 
 A deterministic Sprout bot that runs locally and lets one configured owner
-control a Lexe wallet from a Sprout channel.
+control a Lexe wallet from configured Sprout channels.
 
 LexeBot is not AI-powered. It holds a Nostr bot key for Sprout messages and a
 Lexe SDK client credential string supplied locally by the user. It only accepts
@@ -38,42 +38,43 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.4-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.4/lexebot-v0.1.4-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.4-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.4/lexebot-v0.1.4-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.4-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.5-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.5/lexebot-v0.1.5-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.5-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.5/lexebot-v0.1.5-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.5-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.4-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.5-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
 
 Make sure `~/.local/bin` is on your `PATH`.
 
-### Flint Alpha Scripts
+### Sprout Install Script
 
-For Flint Alpha users on Apple Silicon Macs, the repo includes two wrapper
-scripts:
+For Sprout users on Apple Silicon Macs, the repo includes an installer that
+sets up LexeBot locally and adds Flint Alpha as the default channel:
 
 ```bash
 LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' \
-  bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install-flint-alpha.sh)
-run-lexebot-flint-alpha
+  bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh)
+run-lexebot
 ```
 
 The installer downloads the binary, generates a local LexeBot identity, reads
 the local Sprout owner key from `~/Library/Application Support/xyz.block.sprout.app/identity.key`,
 reads the Lexe SDK client credentials from `LEXE_CLIENT_CREDENTIALS`, stores the local run config in
-`~/.config/lexebot/flint-alpha.env` with file mode `600`, installs the runner
-at `~/.local/bin/run-lexebot-flint-alpha`, and adds the bot to Flint Alpha as
-role `bot` using the invoking user's admin identity. On a fresh install, it
-prints the command to start LexeBot later, then runs LexeBot in the foreground
-in the current terminal so startup logs are visible. On
-rerun, it detects an existing local install and asks whether to start that
-existing bot instead of generating a new identity. LexeBot derives the owner
-display name from the owner's public Sprout profile on startup and publishes
-the bot profile as `LexeBot[<owner display name without spaces>]`.
+`~/.config/lexebot/lexebot.env` with file mode `600`, installs the runner at
+`~/.local/bin/run-lexebot`, installs the channel helper at
+`~/.local/bin/lexebot-add-channel`, and adds the bot to Flint Alpha as role
+`bot` using the invoking user's admin identity. On a fresh install, it prints
+the command to start LexeBot later, then runs LexeBot in the foreground in the
+current terminal so startup logs are visible. On rerun, it detects an existing
+local install and asks whether to start that existing bot instead of generating
+a new identity. LexeBot derives the owner display name from the owner's public
+Sprout profile on startup and publishes the bot profile as
+`LexeBot[<owner display name without spaces>]`.
 If the installer is newer than the local installed version, rerunning the
 installer upgrades the binary and runner while preserving the existing local
 config and bot identity.
@@ -81,13 +82,30 @@ config and bot identity.
 After the first install, start LexeBot from any directory with:
 
 ```bash
-run-lexebot-flint-alpha
+run-lexebot
 ```
 
 If `~/.local/bin` is not on your `PATH`, use this from any directory instead:
 
 ```bash
-bash ~/.local/bin/run-lexebot-flint-alpha
+bash ~/.local/bin/run-lexebot
+```
+
+Add the same installed LexeBot identity to another channel with:
+
+```bash
+lexebot-add-channel <channel-uuid>
+```
+
+Then restart LexeBot with `run-lexebot`. The helper adds the bot pubkey to the
+channel as role `bot` and appends the channel UUID to
+`~/.config/lexebot/lexebot.env`.
+
+Until Sprout exposes a copy button for channel UUIDs in the UI, use the Sprout
+CLI to list channels and copy the target `id`/UUID:
+
+```bash
+sprout list-channels --member
 ```
 
 ### From Source
@@ -102,7 +120,7 @@ Run LexeBot:
 
 ```bash
 SPROUT_RELAY_URL=wss://sprout.up.railway.app \
-SPROUT_CHANNEL_ID=<channel-uuid> \
+SPROUT_CHANNEL_IDS=<channel-uuid>[,<channel-uuid>...] \
 SPROUT_BOT_PRIVATE_KEY=<bot-nsec-or-hex-secret> \
 SPROUT_OWNER_PRIVATE_KEY=<your-sprout-owner-or-agent-secret> \
 SPROUT_BOT_AUTH_MODE=owner-attested \

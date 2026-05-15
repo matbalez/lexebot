@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CHANNEL_ID="1df37399-3c25-4019-8bc7-faacd53587d0"
+DEFAULT_CHANNEL_ID="1df37399-3c25-4019-8bc7-faacd53587d0"
+DEFAULT_CHANNEL_NAME="Flint Alpha"
 RELAY_WS_URL="wss://sprout.up.railway.app"
 RELAY_HTTP_URL="https://sprout.up.railway.app"
-LEXEBOT_VERSION="v0.1.4"
+LEXEBOT_VERSION="v0.1.5"
 LEXEBOT_ARCHIVE="lexebot-${LEXEBOT_VERSION}-aarch64-apple-darwin.tar.gz"
 LEXEBOT_RELEASE_BASE="https://github.com/matbalez/lexebot/releases/download/${LEXEBOT_VERSION}"
-RUNNER_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/run-flint-alpha.sh"
+RUNNER_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/run.sh"
+ADD_CHANNEL_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/add-channel.sh"
 
 INSTALL_DIR="${HOME}/.local/bin"
 LEXEBOT_BIN="${INSTALL_DIR}/lexebot"
-RUNNER_BIN="${INSTALL_DIR}/run-lexebot-flint-alpha"
+RUNNER_BIN="${INSTALL_DIR}/run-lexebot"
+ADD_CHANNEL_BIN="${INSTALL_DIR}/lexebot-add-channel"
+LEGACY_RUNNER_BIN="${INSTALL_DIR}/run-lexebot-flint-alpha"
 CONFIG_DIR="${HOME}/.config/lexebot"
-CONFIG_FILE="${CONFIG_DIR}/flint-alpha.env"
+CONFIG_FILE="${CONFIG_DIR}/lexebot.env"
+LEGACY_CONFIG_FILE="${CONFIG_DIR}/flint-alpha.env"
 SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/xyz.block.sprout.app/identity.key"
 LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/identity.key"
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
@@ -42,10 +47,18 @@ need_cmd() {
 }
 
 start_command() {
-  if command -v run-lexebot-flint-alpha >/dev/null 2>&1; then
-    printf 'run-lexebot-flint-alpha\n'
+  if command -v run-lexebot >/dev/null 2>&1; then
+    printf 'run-lexebot\n'
   else
     printf 'bash %s\n' "$RUNNER_BIN"
+  fi
+}
+
+add_channel_command() {
+  if command -v lexebot-add-channel >/dev/null 2>&1; then
+    printf 'lexebot-add-channel <channel-uuid>\n'
+  else
+    printf 'bash %s <channel-uuid>\n' "$ADD_CHANNEL_BIN"
   fi
 }
 
@@ -59,7 +72,7 @@ lexebot_pid() {
 }
 
 existing_install_present() {
-  [ -x "$LEXEBOT_BIN" ] && [ -x "$RUNNER_BIN" ] && [ -f "$CONFIG_FILE" ]
+  [ -x "$LEXEBOT_BIN" ] && [ -f "$CONFIG_FILE" ] && { [ -x "$RUNNER_BIN" ] || [ -x "$LEGACY_RUNNER_BIN" ]; }
 }
 
 installed_config_version() {
@@ -91,6 +104,113 @@ update_config_version() {
   ' "$CONFIG_FILE" >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$CONFIG_FILE"
+}
+
+migrate_legacy_config() {
+  if [ -f "$CONFIG_FILE" ] || [ ! -f "$LEGACY_CONFIG_FILE" ]; then
+    return 0
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  cp "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  normalize_config_channels
+  say "Migrated ${LEGACY_CONFIG_FILE} to ${CONFIG_FILE}"
+}
+
+normalize_config_channels() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  local existing_channel_ids existing_channel_id quoted_channels tmp
+
+  existing_channel_ids="$(
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    printf '%s\n' "${SPROUT_CHANNEL_IDS:-}"
+  )"
+  existing_channel_id="$(
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    printf '%s\n' "${SPROUT_CHANNEL_ID:-}"
+  )"
+
+  if [ -z "$existing_channel_ids" ] && [ -n "$existing_channel_id" ]; then
+    existing_channel_ids="$existing_channel_id"
+  fi
+  if [ -z "$existing_channel_ids" ]; then
+    existing_channel_ids="$DEFAULT_CHANNEL_ID"
+  fi
+
+  quoted_channels="$(shell_quote "$existing_channel_ids")"
+  tmp="${CONFIG_FILE}.tmp.$$"
+  awk -v quoted_channels="$quoted_channels" '
+    BEGIN { updated = 0 }
+    /^SPROUT_CHANNEL_IDS=/ {
+      print "SPROUT_CHANNEL_IDS=" quoted_channels
+      updated = 1
+      next
+    }
+    /^SPROUT_CHANNEL_ID=/ {
+      if (!updated) {
+        print "SPROUT_CHANNEL_IDS=" quoted_channels
+        updated = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print "SPROUT_CHANNEL_IDS=" quoted_channels
+      }
+    }
+  ' "$CONFIG_FILE" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+ensure_config_bot_pubkey() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  local existing_pubkey bot_nsec derived_pubkey quoted_pubkey tmp
+
+  existing_pubkey="$(
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    printf '%s\n' "${SPROUT_BOT_PUBKEY:-}"
+  )"
+  [ -z "$existing_pubkey" ] || return 0
+
+  bot_nsec="$(
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    printf '%s\n' "${SPROUT_BOT_PRIVATE_KEY:-}"
+  )"
+  [ -n "$bot_nsec" ] || return 0
+  [ -x "$LEXEBOT_BIN" ] || return 0
+
+  derived_pubkey="$(SPROUT_BOT_PRIVATE_KEY="$bot_nsec" "$LEXEBOT_BIN" --print-pubkey | trim)"
+  [ -n "$derived_pubkey" ] || return 0
+
+  quoted_pubkey="$(shell_quote "$derived_pubkey")"
+  tmp="${CONFIG_FILE}.tmp.$$"
+  awk -v quoted_pubkey="$quoted_pubkey" '
+    BEGIN { inserted = 0 }
+    /^SPROUT_BOT_PRIVATE_KEY=/ {
+      if (!inserted) {
+        print "SPROUT_BOT_PUBKEY=" quoted_pubkey
+        inserted = 1
+      }
+      print
+      next
+    }
+    { print }
+    END {
+      if (!inserted) {
+        print "SPROUT_BOT_PUBKEY=" quoted_pubkey
+      }
+    }
+  ' "$CONFIG_FILE" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  say "Stored LexeBot pubkey in ${CONFIG_FILE}."
 }
 
 confirm_yes() {
@@ -175,6 +295,9 @@ handle_existing_install() {
   say "- ${LEXEBOT_BIN}"
   say "- ${RUNNER_BIN}"
   say "- ${CONFIG_FILE}"
+  install_runner
+  normalize_config_channels
+  ensure_config_bot_pubkey
 
   installed_version="$(installed_config_version)"
   if [ "$installed_version" != "$LEXEBOT_VERSION" ]; then
@@ -185,6 +308,7 @@ handle_existing_install() {
     download_lexebot
     install_runner
     update_config_version
+    ensure_config_bot_pubkey
     say "Upgraded existing LexeBot install to ${LEXEBOT_VERSION}."
     start_lexebot
     exit 0
@@ -321,9 +445,10 @@ download_lexebot() {
 }
 
 install_runner() {
-  local script_dir local_runner
+  local script_dir local_runner local_add_channel
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
-  local_runner="${script_dir}/run-flint-alpha.sh"
+  local_runner="${script_dir}/run.sh"
+  local_add_channel="${script_dir}/add-channel.sh"
   mkdir -p "$INSTALL_DIR"
 
   if [ -f "$local_runner" ]; then
@@ -335,6 +460,22 @@ install_runner() {
   fi
 
   say "Installed runner ${RUNNER_BIN}"
+
+  if [ -f "$local_add_channel" ]; then
+    install -m 700 "$local_add_channel" "$ADD_CHANNEL_BIN"
+  else
+    need_cmd curl
+    curl -fL -o "$ADD_CHANNEL_BIN" "$ADD_CHANNEL_URL"
+    chmod 700 "$ADD_CHANNEL_BIN"
+  fi
+
+  say "Installed channel helper ${ADD_CHANNEL_BIN}"
+
+  cat >"$LEGACY_RUNNER_BIN" <<EOF
+#!/usr/bin/env bash
+exec "$RUNNER_BIN" "\$@"
+EOF
+  chmod 700 "$LEGACY_RUNNER_BIN"
 }
 
 generate_bot_identity() {
@@ -369,21 +510,23 @@ read_lexe_credentials() {
     return 0
   fi
 
-  fail "set LEXE_CLIENT_CREDENTIALS before running the installer, e.g. LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install-flint-alpha.sh)"
+  fail "set LEXE_CLIENT_CREDENTIALS before running the installer, e.g. LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh)"
 }
 
 write_config() {
   local owner_key="$1"
-  local bot_nsec="$2"
-  local lexe_credentials="$3"
+  local bot_pubkey="$2"
+  local bot_nsec="$3"
+  local lexe_credentials="$4"
 
   mkdir -p "$CONFIG_DIR"
   umask 077
   {
     printf 'SPROUT_RELAY_URL=%s\n' "$(shell_quote "$RELAY_WS_URL")"
     printf 'SPROUT_HTTP_RELAY_URL=%s\n' "$(shell_quote "$RELAY_HTTP_URL")"
-    printf 'SPROUT_CHANNEL_ID=%s\n' "$(shell_quote "$CHANNEL_ID")"
+    printf 'SPROUT_CHANNEL_IDS=%s\n' "$(shell_quote "$DEFAULT_CHANNEL_ID")"
     printf 'SPROUT_OWNER_PRIVATE_KEY=%s\n' "$(shell_quote "$owner_key")"
+    printf 'SPROUT_BOT_PUBKEY=%s\n' "$(shell_quote "$bot_pubkey")"
     printf 'SPROUT_BOT_PRIVATE_KEY=%s\n' "$(shell_quote "$bot_nsec")"
     printf 'SPROUT_BOT_AUTH_MODE=%s\n' "$(shell_quote "owner-attested")"
     printf 'LEXE_CLIENT_CREDENTIALS=%s\n' "$(shell_quote "$lexe_credentials")"
@@ -399,15 +542,15 @@ sprout_add_bot_to_channel() {
   local owner_key="$2"
   local bot_pubkey="$3"
 
-  say "Adding LexeBot to Flint Alpha as role bot..."
+  say "Adding LexeBot to ${DEFAULT_CHANNEL_NAME} as role bot..."
   if "$sprout_cli" channels add-member --help >/dev/null 2>&1; then
     SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
       --relay "$RELAY_HTTP_URL" \
       channels add-member \
-      --channel "$CHANNEL_ID" \
+      --channel "$DEFAULT_CHANNEL_ID" \
       --pubkey "$bot_pubkey" \
       --role bot
-    say "LexeBot was added to Flint Alpha."
+    say "LexeBot was added to ${DEFAULT_CHANNEL_NAME}."
     return 0
   fi
 
@@ -415,10 +558,10 @@ sprout_add_bot_to_channel() {
     SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
       --relay "$RELAY_HTTP_URL" \
       add-channel-member \
-      --channel "$CHANNEL_ID" \
+      --channel "$DEFAULT_CHANNEL_ID" \
       --pubkey "$bot_pubkey" \
       --role bot
-    say "LexeBot was added to Flint Alpha."
+    say "LexeBot was added to ${DEFAULT_CHANNEL_NAME}."
     return 0
   fi
 
@@ -429,6 +572,7 @@ main() {
   need_cmd awk
   need_cmd sed
 
+  migrate_legacy_config
   handle_existing_install
 
   download_lexebot
@@ -446,11 +590,14 @@ main() {
   lexe_credentials="$(read_lexe_credentials)"
   sprout_cli="$(ensure_sprout_cli)"
 
-  write_config "$owner_key" "$bot_nsec" "$lexe_credentials"
+  write_config "$owner_key" "$bot_pubkey" "$bot_nsec" "$lexe_credentials"
   sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey"
 
   say
   say "Install complete."
+  say "Default channel configured: ${DEFAULT_CHANNEL_NAME} (${DEFAULT_CHANNEL_ID})"
+  say "Add another channel later with:"
+  say "$(add_channel_command)"
   start_lexebot
 }
 
