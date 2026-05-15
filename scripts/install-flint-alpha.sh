@@ -14,6 +14,7 @@ LEXEBOT_BIN="${INSTALL_DIR}/lexebot"
 RUNNER_BIN="${INSTALL_DIR}/run-lexebot-flint-alpha"
 CONFIG_DIR="${HOME}/.config/lexebot"
 CONFIG_FILE="${CONFIG_DIR}/flint-alpha.env"
+LOG_FILE="${CONFIG_DIR}/flint-alpha.log"
 SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/xyz.block.sprout.app/identity.key"
 LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/identity.key"
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
@@ -41,6 +42,54 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+start_command() {
+  if command -v run-lexebot-flint-alpha >/dev/null 2>&1; then
+    printf 'run-lexebot-flint-alpha\n'
+  else
+    printf 'bash %s\n' "$RUNNER_BIN"
+  fi
+}
+
+print_start_command() {
+  say "Future start command:"
+  say "$(start_command)"
+}
+
+lexebot_pid() {
+  pgrep -f "$LEXEBOT_BIN" 2>/dev/null | head -n 1 || true
+}
+
+existing_install_present() {
+  [ -x "$LEXEBOT_BIN" ] && [ -x "$RUNNER_BIN" ] && [ -f "$CONFIG_FILE" ]
+}
+
+confirm_yes() {
+  local prompt="$1"
+  local default_answer="$2"
+  local answer suffix
+
+  case "$default_answer" in
+    yes) suffix="[Y/n]" ;;
+    no) suffix="[y/N]" ;;
+    *) fail "invalid default answer: ${default_answer}" ;;
+  esac
+
+  printf '%s %s ' "$prompt" "$suffix" >&2
+  IFS= read -r answer || answer=""
+  answer="$(printf '%s' "$answer" | trim | tr '[:upper:]' '[:lower:]')"
+
+  if [ -z "$answer" ]; then
+    [ "$default_answer" = "yes" ]
+    return
+  fi
+
+  case "$answer" in
+    y|yes) return 0 ;;
+    n|no) return 1 ;;
+    *) fail "please answer yes or no" ;;
+  esac
+}
+
 trim() {
   awk '{$1=$1; print}'
 }
@@ -65,6 +114,57 @@ find_owner_key_file() {
     return 0
   fi
   return 1
+}
+
+start_lexebot() {
+  local pid
+
+  pid="$(lexebot_pid)"
+  if [ -n "$pid" ]; then
+    say "LexeBot is already running with pid ${pid}."
+    print_start_command
+    return 0
+  fi
+
+  [ -x "$RUNNER_BIN" ] || fail "runner is not executable at ${RUNNER_BIN}"
+  mkdir -p "$CONFIG_DIR"
+  say "Starting LexeBot in the background..."
+  say "Logs: ${LOG_FILE}"
+  nohup "$RUNNER_BIN" >"$LOG_FILE" 2>&1 &
+  pid="$!"
+  disown "$pid" 2>/dev/null || true
+
+  sleep 2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    fail "LexeBot exited immediately. Check ${LOG_FILE}"
+  fi
+
+  say "LexeBot started with pid ${pid}."
+  print_start_command
+}
+
+handle_existing_install() {
+  if ! existing_install_present; then
+    return 0
+  fi
+
+  say "Existing LexeBot install found:"
+  say "- ${LEXEBOT_BIN}"
+  say "- ${RUNNER_BIN}"
+  say "- ${CONFIG_FILE}"
+
+  if [ -n "$(lexebot_pid)" ]; then
+    start_lexebot
+    exit 0
+  fi
+
+  if confirm_yes "Start the existing LexeBot now?" yes; then
+    start_lexebot
+  else
+    say "Leaving the existing LexeBot install unchanged."
+    print_start_command
+  fi
+  exit 0
 }
 
 is_sprout_cli() {
@@ -377,6 +477,8 @@ main() {
   need_cmd awk
   need_cmd sed
 
+  handle_existing_install
+
   download_lexebot
   install_runner
 
@@ -399,11 +501,8 @@ main() {
   sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey"
 
   say
-  say "Done. Start LexeBot with:"
-  say "$RUNNER_BIN"
-  say
-  say "If ${INSTALL_DIR} is not on your PATH, run:"
-  say "bash $RUNNER_BIN"
+  say "Install complete."
+  start_lexebot
 }
 
 main "$@"

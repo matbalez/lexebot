@@ -66,7 +66,10 @@ the local Sprout owner key from `~/Library/Application Support/xyz.block.sprout.
 asks only for the Lexe SDK client credentials, stores the local run config in
 `~/.config/lexebot/flint-alpha.env` with file mode `600`, installs the runner
 at `~/.local/bin/run-lexebot-flint-alpha`, and adds the bot to Flint Alpha as
-role `bot` using the invoking user's admin identity.
+role `bot` using the invoking user's admin identity. On a fresh install, it
+starts LexeBot in the background and prints the command to start it later. On
+rerun, it detects an existing local install and asks whether to start that
+existing bot instead of generating a new identity.
 
 ### From Source
 
