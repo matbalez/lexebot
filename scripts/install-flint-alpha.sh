@@ -62,6 +62,37 @@ existing_install_present() {
   [ -x "$LEXEBOT_BIN" ] && [ -x "$RUNNER_BIN" ] && [ -f "$CONFIG_FILE" ]
 }
 
+installed_config_version() {
+  [ -f "$CONFIG_FILE" ] || return 1
+  (
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+    printf '%s\n' "${LEXEBOT_VERSION:-}"
+  ) 2>/dev/null || true
+}
+
+update_config_version() {
+  local tmp quoted_version
+  tmp="${CONFIG_FILE}.tmp.$$"
+  quoted_version="$(shell_quote "$LEXEBOT_VERSION")"
+  awk -v quoted_version="$quoted_version" '
+    BEGIN { updated = 0 }
+    /^LEXEBOT_VERSION=/ {
+      print "LEXEBOT_VERSION=" quoted_version
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print "LEXEBOT_VERSION=" quoted_version
+      }
+    }
+  ' "$CONFIG_FILE" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
 confirm_yes() {
   local prompt="$1"
   local default_answer="$2"
@@ -134,6 +165,8 @@ start_lexebot() {
 }
 
 handle_existing_install() {
+  local installed_version
+
   if ! existing_install_present; then
     return 0
   fi
@@ -142,6 +175,20 @@ handle_existing_install() {
   say "- ${LEXEBOT_BIN}"
   say "- ${RUNNER_BIN}"
   say "- ${CONFIG_FILE}"
+
+  installed_version="$(installed_config_version)"
+  if [ "$installed_version" != "$LEXEBOT_VERSION" ]; then
+    say "Existing LexeBot version is ${installed_version:-unknown}; upgrading to ${LEXEBOT_VERSION}."
+    if [ -n "$(lexebot_pid)" ]; then
+      fail "LexeBot is currently running. Stop it with Ctrl-C, then rerun this installer to upgrade."
+    fi
+    download_lexebot
+    install_runner
+    update_config_version
+    say "Upgraded existing LexeBot install to ${LEXEBOT_VERSION}."
+    start_lexebot
+    exit 0
+  fi
 
   if [ -n "$(lexebot_pid)" ]; then
     start_lexebot

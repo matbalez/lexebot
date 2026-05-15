@@ -74,6 +74,9 @@ rerun, it detects an existing local install and asks whether to start that
 existing bot instead of generating a new identity. LexeBot derives the owner
 display name from the owner's public Sprout profile on startup and publishes
 the bot profile as `LexeBot[<owner display name without spaces>]`.
+If the installer is newer than the local installed version, rerunning the
+installer upgrades the binary and runner while preserving the existing local
+config and bot identity.
 
 After the first install, start LexeBot from any directory with:
 
