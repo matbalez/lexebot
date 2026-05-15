@@ -183,6 +183,9 @@ from that Kudos bot:
 The command only executes when `<sender-pubkey>` is this LexeBot's configured
 owner. Normal wallet commands still require the owner pubkey.
 
+The Flint Alpha installer sets `LEXEBOT_KUDOS_BOT_PUBKEY` to the Flint Alpha
+Kudos bot pubkey by default, and backfills that value for existing installs.
+
 If startup logs say LexeBot is authenticated but is not a channel member, add
 the printed bot pubkey to the channel as a bot using a Sprout identity allowed
 to add members. In Flint Alpha, Steve and DK can run this themselves if they

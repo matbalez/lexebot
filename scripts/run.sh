@@ -21,6 +21,9 @@ fi
 if [ -z "${SPROUT_CHANNEL_IDS:-}" ] && [ -n "${SPROUT_CHANNEL_ID:-}" ]; then
   SPROUT_CHANNEL_IDS="$SPROUT_CHANNEL_ID"
 fi
+if [ -z "${SPROUT_CHANNEL_ID:-}" ] && [ -n "${SPROUT_CHANNEL_IDS:-}" ]; then
+  SPROUT_CHANNEL_ID="${SPROUT_CHANNEL_IDS%%[ ,]*}"
+fi
 
 : "${SPROUT_RELAY_URL:?missing SPROUT_RELAY_URL in config}"
 : "${SPROUT_CHANNEL_IDS:?missing SPROUT_CHANNEL_IDS in config}"
@@ -33,11 +36,13 @@ fi
 [ -x "$LEXEBOT_BIN" ] || fail "LexeBot binary is not executable at ${LEXEBOT_BIN}"
 
 export SPROUT_RELAY_URL
+export SPROUT_CHANNEL_ID
 export SPROUT_CHANNEL_IDS
 export SPROUT_OWNER_PRIVATE_KEY
 export SPROUT_BOT_PRIVATE_KEY
 export SPROUT_BOT_AUTH_MODE
 export LEXEBOT_OWNER_DISPLAY_NAME
+export LEXEBOT_KUDOS_BOT_PUBKEY
 export LEXE_CLIENT_CREDENTIALS
 
 exec "$LEXEBOT_BIN"

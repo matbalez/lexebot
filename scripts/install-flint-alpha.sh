@@ -3,6 +3,7 @@ set -euo pipefail
 
 DEFAULT_CHANNEL_ID="1df37399-3c25-4019-8bc7-faacd53587d0"
 DEFAULT_CHANNEL_NAME="Flint Alpha"
+DEFAULT_KUDOS_BOT_PUBKEY="84c220e52abb478dad3b96796383bea7dd989fb1540ea26b3478f706f78b7f8c"
 RELAY_WS_URL="wss://sprout.up.railway.app"
 RELAY_HTTP_URL="https://sprout.up.railway.app"
 LEXEBOT_VERSION="v0.1.5"
@@ -223,6 +224,41 @@ ensure_config_bot_pubkey() {
   say "Stored LexeBot pubkey in ${CONFIG_FILE}."
 }
 
+ensure_config_kudos_bot_pubkey() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  local existing_pubkey quoted_pubkey tmp
+
+  existing_pubkey="$(
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    printf '%s\n' "${LEXEBOT_KUDOS_BOT_PUBKEY:-}"
+  )"
+  [ -z "$existing_pubkey" ] || return 0
+
+  quoted_pubkey="$(shell_quote "$DEFAULT_KUDOS_BOT_PUBKEY")"
+  tmp="${CONFIG_FILE}.tmp.$$"
+  awk -v quoted_pubkey="$quoted_pubkey" '
+    BEGIN { inserted = 0 }
+    /^LEXE_CLIENT_CREDENTIALS=/ {
+      if (!inserted) {
+        print "LEXEBOT_KUDOS_BOT_PUBKEY=" quoted_pubkey
+        inserted = 1
+      }
+      print
+      next
+    }
+    { print }
+    END {
+      if (!inserted) {
+        print "LEXEBOT_KUDOS_BOT_PUBKEY=" quoted_pubkey
+      }
+    }
+  ' "$CONFIG_FILE" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  say "Stored Flint Alpha Kudos bot pubkey in ${CONFIG_FILE}."
+}
+
 confirm_yes() {
   local prompt="$1"
   local default_answer="$2"
@@ -308,6 +344,7 @@ handle_existing_install() {
   install_runner
   normalize_config_channels
   ensure_config_bot_pubkey
+  ensure_config_kudos_bot_pubkey
 
   installed_version="$(installed_config_version)"
   if [ "$installed_version" != "$LEXEBOT_VERSION" ]; then
@@ -319,6 +356,7 @@ handle_existing_install() {
     install_runner
     update_config_version
     ensure_config_bot_pubkey
+    ensure_config_kudos_bot_pubkey
     say "Upgraded existing LexeBot install to ${LEXEBOT_VERSION}."
     start_lexebot
     exit 0
@@ -550,6 +588,7 @@ write_config() {
     printf 'SPROUT_BOT_PUBKEY=%s\n' "$(shell_quote "$bot_pubkey")"
     printf 'SPROUT_BOT_PRIVATE_KEY=%s\n' "$(shell_quote "$bot_nsec")"
     printf 'SPROUT_BOT_AUTH_MODE=%s\n' "$(shell_quote "owner-attested")"
+    printf 'LEXEBOT_KUDOS_BOT_PUBKEY=%s\n' "$(shell_quote "$DEFAULT_KUDOS_BOT_PUBKEY")"
     printf 'LEXE_CLIENT_CREDENTIALS=%s\n' "$(shell_quote "$lexe_credentials")"
     printf 'LEXEBOT_BIN=%s\n' "$(shell_quote "$LEXEBOT_BIN")"
     printf 'LEXEBOT_VERSION=%s\n' "$(shell_quote "$LEXEBOT_VERSION")"
