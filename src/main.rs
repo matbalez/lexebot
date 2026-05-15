@@ -1,7 +1,7 @@
 //! A deterministic Sprout bot for controlling one owner's Lexe wallet.
 
 use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -29,6 +29,9 @@ use url::Url as WsUrl;
 const DEFAULT_RELAY_URL: &str = "ws://localhost:3000";
 const SUBSCRIPTION_ID: &str = "lexebot";
 const OWNER_PROFILE_SUBSCRIPTION_ID: &str = "lexebot-owner-profile";
+const AUTO_KUDOS_COMMAND_KIND: u16 = 21_000;
+const AUTO_KUDOS_RESULT_KIND: u16 = 21_001;
+const DM_OPEN_KIND: u16 = 41_010;
 const BOT_NAME: &str = "lexebot";
 const BOT_DISPLAY_NAME: &str = "LexeBot";
 const BOT_ABOUT: &str = "A deterministic Sprout bot that lets one owner control a Lexe wallet.";
@@ -94,17 +97,19 @@ impl LexeClient {
         })
     }
 
-    async fn execute(&self, command: BotCommand) -> Result<String> {
+    async fn execute(&self, command: BotCommand) -> Result<Option<String>> {
         match command {
-            BotCommand::GetBalance => self.get_balance().await,
-            BotCommand::GetBolt12 => self.get_bolt12().await,
-            BotCommand::CreateInvoice { amount } => self.create_invoice(amount).await,
-            BotCommand::Send { amount, payable } => self.send_payment(amount, payable).await,
+            BotCommand::GetBalance => self.get_balance().await.map(Some),
+            BotCommand::GetBolt12 => self.get_bolt12().await.map(Some),
+            BotCommand::CreateInvoice { amount } => self.create_invoice(amount).await.map(Some),
+            BotCommand::Send { amount, payable } => {
+                self.send_payment(amount, payable).await.map(Some)
+            }
             BotCommand::AutoKudosSend {
                 amount, payable, ..
             } => {
-                let payment = self.send_payment(amount, payable).await?;
-                Ok(format!("Auto-kudos {payment}"))
+                self.send_payment(amount, payable).await?;
+                Ok(None)
             }
         }
     }
@@ -508,10 +513,12 @@ async fn subscribe_to_channels(ws: &mut Ws, channel_ids: &[String]) -> Result<()
 }
 
 async fn subscribe_to_channel(ws: &mut Ws, channel_id: &str) -> Result<()> {
-    let filter = Filter::new().kind(Kind::Custom(9)).custom_tag(
-        SingleLetterTag::lowercase(Alphabet::H),
-        [channel_id.to_string()],
-    );
+    let filter = Filter::new()
+        .kinds([Kind::Custom(9), Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND)])
+        .custom_tag(
+            SingleLetterTag::lowercase(Alphabet::H),
+            [channel_id.to_string()],
+        );
     send_json(ws, json!(["REQ", subscription_id(channel_id), filter])).await
 }
 
@@ -593,10 +600,44 @@ async fn maybe_reply(
         return Ok(());
     };
 
+    let mut reply_mentions = reply_mentions(event, &runtime.config);
     let reply = match parse_command(&event.content) {
         Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => {
+            let is_auto_kudos = command.is_auto_kudos();
+            let private_ack = command.private_channel_ack(&event.content);
             match runtime.lexe.execute(command).await {
-                Ok(reply) => reply,
+                Ok(Some(private_body)) if private_ack.is_some() => {
+                    match send_dm_message(
+                        ws,
+                        &runtime.config,
+                        runtime.config.owner_pubkey,
+                        &private_body,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            reply_mentions.push(runtime.config.owner_pubkey.to_hex());
+                            private_ack.expect("checked private ack")
+                        }
+                        Err(err) => {
+                            format!("Lexe command failed: could not send private response: {err:#}")
+                        }
+                    }
+                }
+                Ok(Some(reply)) => reply,
+                Ok(None) => {
+                    send_auto_kudos_result(ws, &runtime.config, channel_id, event, true).await?;
+                    eprintln!("processed silent auto-kudos command {}", event.id.to_hex());
+                    return Ok(());
+                }
+                Err(err) if is_auto_kudos => {
+                    send_auto_kudos_result(ws, &runtime.config, channel_id, event, false).await?;
+                    eprintln!(
+                        "silent auto-kudos command {} failed: {err:#}",
+                        event.id.to_hex()
+                    );
+                    return Ok(());
+                }
                 Err(err) => format!("Lexe command failed: {err:#}"),
             }
         }
@@ -607,13 +648,81 @@ async fn maybe_reply(
         Err(err) => format!("Invalid LexeBot command: {err}"),
     };
 
-    let reply_event = build_message(channel_id, &reply, &reply_mentions(event, &runtime.config))?
+    let reply_event = build_message(channel_id, &reply, &reply_mentions)?
         .sign_with_keys(&runtime.config.bot_keys)?;
     let reply_event_id = reply_event.id.to_hex();
 
     send_json(ws, json!(["EVENT", reply_event])).await?;
     eprintln!("replied to {} with {}", event.id.to_hex(), reply_event_id);
     Ok(())
+}
+
+async fn send_auto_kudos_result(
+    ws: &mut Ws,
+    config: &Config,
+    channel_id: &str,
+    request: &Event,
+    sent: bool,
+) -> Result<()> {
+    let content = if sent { "sent" } else { "failed" };
+    let event = EventBuilder::new(
+        Kind::Ephemeral(AUTO_KUDOS_RESULT_KIND),
+        content,
+        [
+            Tag::parse(&["h", channel_id])?,
+            Tag::parse(&["e", &request.id.to_hex()])?,
+            Tag::parse(&["p", &request.pubkey.to_hex()])?,
+        ],
+    )
+    .sign_with_keys(&config.bot_keys)?;
+    send_json(ws, json!(["EVENT", event])).await
+}
+
+async fn send_dm_message(
+    ws: &mut Ws,
+    config: &Config,
+    recipient: PublicKey,
+    content: &str,
+) -> Result<()> {
+    let channel_id = open_dm_channel(ws, config, recipient).await?;
+    let event = build_message(&channel_id, content, &[recipient.to_hex()])?
+        .sign_with_keys(&config.bot_keys)?;
+    let event_id = event.id.to_hex();
+    send_json(ws, json!(["EVENT", event])).await?;
+    wait_for_ok(ws, &event_id).await?;
+    Ok(())
+}
+
+async fn open_dm_channel(ws: &mut Ws, config: &Config, recipient: PublicKey) -> Result<String> {
+    let dedupe = format!(
+        "lexebot-dm-{}-{}",
+        recipient.to_hex(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before UNIX epoch")?
+            .as_nanos()
+    );
+    let event = EventBuilder::new(
+        Kind::Custom(DM_OPEN_KIND),
+        "",
+        [
+            Tag::parse(&["p", &recipient.to_hex()])?,
+            Tag::parse(&["d", &dedupe])?,
+        ],
+    )
+    .sign_with_keys(&config.bot_keys)?;
+    let event_id = event.id.to_hex();
+
+    send_json(ws, json!(["EVENT", event])).await?;
+    let message = wait_for_ok_message(ws, &event_id).await?;
+    dm_channel_id_from_ok_message(&message)
+        .ok_or_else(|| anyhow!("DM open response did not include channel_id"))
+}
+
+fn dm_channel_id_from_ok_message(message: &str) -> Option<String> {
+    let response = message.strip_prefix("response:")?;
+    let value: Value = serde_json::from_str(response).ok()?;
+    value.get("channel_id")?.as_str().map(str::to_string)
 }
 
 fn command_authorized(command: &BotCommand, sender: PublicKey, config: &Config) -> bool {
@@ -663,6 +772,24 @@ enum BotCommand {
     },
 }
 
+impl BotCommand {
+    fn is_auto_kudos(&self) -> bool {
+        matches!(self, Self::AutoKudosSend { .. })
+    }
+
+    fn private_channel_ack(&self, content: &str) -> Option<String> {
+        let subject = match self {
+            Self::GetBalance => "your balance",
+            Self::CreateInvoice { .. } => "your invoice",
+            _ => return None,
+        };
+        Some(format!(
+            "I've DM'ed you {subject} {}",
+            command_owner_mention(content)
+        ))
+    }
+}
+
 fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
     let tokens = content.split_whitespace().collect::<Vec<_>>();
     if !content.trim_start().starts_with('@') {
@@ -688,6 +815,27 @@ fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
         "auto-kudos" => parse_auto_kudos_command(rest),
         _ => Err(command_help()),
     }
+}
+
+fn command_owner_mention(content: &str) -> String {
+    content
+        .split_whitespace()
+        .find(|token| is_bot_mention_token(token))
+        .and_then(lexebot_bracket_name)
+        .map(|name| format!("@{name}"))
+        .unwrap_or_else(|| "@owner".to_string())
+}
+
+fn lexebot_bracket_name(token: &str) -> Option<String> {
+    let cleaned = token
+        .trim_start_matches('@')
+        .trim_end_matches([',', '.', '!', '?', ':', ';']);
+    let lower = cleaned.to_ascii_lowercase();
+    if !lower.starts_with("lexebot[") || !lower.ends_with(']') {
+        return None;
+    }
+    let name = cleaned.get("lexebot[".len()..cleaned.len() - 1)?;
+    clean_display_name(name).map(|name| name.replace(' ', ""))
 }
 
 fn parse_get_command(tokens: &[&str]) -> std::result::Result<BotCommand, String> {
@@ -774,7 +922,7 @@ fn format_amount(amount: u64) -> String {
 fn is_bot_mention_token(token: &str) -> bool {
     let normalized = token
         .trim_start_matches('@')
-        .trim_end_matches(|ch: char| matches!(ch, ',' | '.' | '!' | '?' | ':' | ';'))
+        .trim_end_matches([',', '.', '!', '?', ':', ';'])
         .to_ascii_lowercase();
     normalized == BOT_NAME
         || normalized == "lexe-bot"
@@ -1014,6 +1162,10 @@ fn is_lower_hex(value: &str, expected_len: usize) -> bool {
 }
 
 async fn wait_for_ok(ws: &mut Ws, event_id: &str) -> Result<()> {
+    wait_for_ok_message(ws, event_id).await.map(|_| ())
+}
+
+async fn wait_for_ok_message(ws: &mut Ws, event_id: &str) -> Result<String> {
     loop {
         let text = next_text(ws, Duration::from_secs(5)).await?;
         let value: Value = serde_json::from_str(&text)?;
@@ -1024,7 +1176,11 @@ async fn wait_for_ok(ws: &mut Ws, event_id: &str) -> Result<()> {
             continue;
         }
         if value.get(2).and_then(Value::as_bool) == Some(true) {
-            return Ok(());
+            return Ok(value
+                .get(3)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string());
         }
         let reason = value
             .get(3)
