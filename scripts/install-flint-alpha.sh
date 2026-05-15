@@ -14,7 +14,6 @@ LEXEBOT_BIN="${INSTALL_DIR}/lexebot"
 RUNNER_BIN="${INSTALL_DIR}/run-lexebot-flint-alpha"
 CONFIG_DIR="${HOME}/.config/lexebot"
 CONFIG_FILE="${CONFIG_DIR}/flint-alpha.env"
-LOG_FILE="${CONFIG_DIR}/flint-alpha.log"
 SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/xyz.block.sprout.app/identity.key"
 LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/identity.key"
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
@@ -127,20 +126,11 @@ start_lexebot() {
   fi
 
   [ -x "$RUNNER_BIN" ] || fail "runner is not executable at ${RUNNER_BIN}"
-  mkdir -p "$CONFIG_DIR"
-  say "Starting LexeBot in the background..."
-  say "Logs: ${LOG_FILE}"
-  nohup "$RUNNER_BIN" >"$LOG_FILE" 2>&1 &
-  pid="$!"
-  disown "$pid" 2>/dev/null || true
-
-  sleep 2
-  if ! kill -0 "$pid" 2>/dev/null; then
-    fail "LexeBot exited immediately. Check ${LOG_FILE}"
-  fi
-
-  say "LexeBot started with pid ${pid}."
   print_start_command
+  say
+  say "Starting LexeBot in this terminal. Leave this process running."
+  say "Press Ctrl-C to stop LexeBot."
+  exec "$RUNNER_BIN"
 }
 
 handle_existing_install() {
@@ -322,7 +312,7 @@ normalize_lexe_credentials() {
 }
 
 read_lexe_credentials() {
-  local creds path ready
+  local creds
 
   if [ -n "${LEXE_CLIENT_CREDENTIALS:-}" ]; then
     creds="$(normalize_lexe_credentials "$LEXE_CLIENT_CREDENTIALS")"
@@ -332,30 +322,7 @@ read_lexe_credentials() {
     return 0
   fi
 
-  if command -v pbpaste >/dev/null 2>&1; then
-    say "Copy your Lexe SDK client credentials to the macOS clipboard."
-    say "Do not paste the credential into Terminal; the installer will read it with pbpaste."
-    printf 'Press Return when the credential is on your clipboard: ' >&2
-    IFS= read -r ready || true
-
-    creds="$(normalize_lexe_credentials "$(pbpaste)")"
-    [ -n "$creds" ] || fail "clipboard did not contain Lexe SDK client credentials"
-    say "Read Lexe SDK client credentials from clipboard (${#creds} characters)."
-    printf '%s\n' "$creds"
-    return 0
-  fi
-
-  say "pbpaste is not available. Save your Lexe SDK client credentials to a local file."
-  printf 'Credential file path: ' >&2
-  IFS= read -r path || path=""
-  path="$(printf '%s' "$path" | trim)"
-  [ -n "$path" ] || fail "credential file path cannot be empty"
-  [ -f "$path" ] || fail "credential file not found: ${path}"
-
-  creds="$(normalize_lexe_credentials "$(/bin/cat "$path")")"
-  [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
-  say "Read Lexe SDK client credentials from file (${#creds} characters)."
-  printf '%s\n' "$creds"
+  fail "set LEXE_CLIENT_CREDENTIALS before running the installer, e.g. LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install-flint-alpha.sh)"
 }
 
 write_config() {

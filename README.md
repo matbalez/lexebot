@@ -57,17 +57,19 @@ For Flint Alpha users on Apple Silicon Macs, the repo includes two wrapper
 scripts:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install-flint-alpha.sh)
+LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' \
+  bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install-flint-alpha.sh)
 run-lexebot-flint-alpha
 ```
 
 The installer downloads the binary, generates a local LexeBot identity, reads
 the local Sprout owner key from `~/Library/Application Support/xyz.block.sprout.app/identity.key`,
-asks only for the Lexe SDK client credentials, stores the local run config in
+reads the Lexe SDK client credentials from `LEXE_CLIENT_CREDENTIALS`, stores the local run config in
 `~/.config/lexebot/flint-alpha.env` with file mode `600`, installs the runner
 at `~/.local/bin/run-lexebot-flint-alpha`, and adds the bot to Flint Alpha as
 role `bot` using the invoking user's admin identity. On a fresh install, it
-starts LexeBot in the background and prints the command to start it later. On
+prints the command to start LexeBot later, then runs LexeBot in the foreground
+in the current terminal so startup logs are visible. On
 rerun, it detects an existing local install and asks whether to start that
 existing bot instead of generating a new identity. LexeBot derives the owner
 display name from the owner's public Sprout profile on startup and publishes
