@@ -38,6 +38,7 @@ const BOT_ABOUT: &str = "A deterministic Sprout bot that lets one owner control 
 const BOT_ICON_DATA_URL: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='28' fill='%23111618'/%3E%3Cpath d='M35 84 64 28l29 56H76L64 58 52 84H35Z' fill='%23f4c542'/%3E%3Cpath d='M43 96h42' stroke='%238fd4ff' stroke-width='10' stroke-linecap='round'/%3E%3C/svg%3E";
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+const AUTO_KUDOS_PAYMENT_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -605,6 +606,35 @@ async fn maybe_reply(
         Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => {
             let is_auto_kudos = command.is_auto_kudos();
             let private_ack = command.private_channel_ack(&event.content);
+            if is_auto_kudos {
+                let command_event_id = event.id.to_hex();
+                match tokio::time::timeout(
+                    AUTO_KUDOS_PAYMENT_TIMEOUT,
+                    runtime.lexe.execute(command),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        send_auto_kudos_result(ws, &runtime.config, channel_id, event, true)
+                            .await?;
+                        eprintln!("processed silent auto-kudos command {command_event_id}");
+                    }
+                    Ok(Err(err)) => {
+                        send_auto_kudos_result(ws, &runtime.config, channel_id, event, false)
+                            .await?;
+                        eprintln!("silent auto-kudos command {command_event_id} failed: {err:#}");
+                    }
+                    Err(_) => {
+                        send_auto_kudos_result(ws, &runtime.config, channel_id, event, false)
+                            .await?;
+                        eprintln!(
+                            "silent auto-kudos command {command_event_id} timed out after {} seconds",
+                            AUTO_KUDOS_PAYMENT_TIMEOUT.as_secs()
+                        );
+                    }
+                }
+                return Ok(());
+            }
             match runtime.lexe.execute(command).await {
                 Ok(Some(private_body)) if private_ack.is_some() => {
                     match send_dm_message(
@@ -625,19 +655,7 @@ async fn maybe_reply(
                     }
                 }
                 Ok(Some(reply)) => reply,
-                Ok(None) => {
-                    send_auto_kudos_result(ws, &runtime.config, channel_id, event, true).await?;
-                    eprintln!("processed silent auto-kudos command {}", event.id.to_hex());
-                    return Ok(());
-                }
-                Err(err) if is_auto_kudos => {
-                    send_auto_kudos_result(ws, &runtime.config, channel_id, event, false).await?;
-                    eprintln!(
-                        "silent auto-kudos command {} failed: {err:#}",
-                        event.id.to_hex()
-                    );
-                    return Ok(());
-                }
+                Ok(None) => return Ok(()),
                 Err(err) => format!("Lexe command failed: {err:#}"),
             }
         }
