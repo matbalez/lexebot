@@ -326,11 +326,11 @@ read_lexe_credentials() {
   fi
 
   say "Paste your Lexe SDK client credentials, then press Return."
-  say "Input is visible so long client strings paste normally."
+  say "The credential will not be echoed; a character count is printed after capture."
   printf 'Lexe SDK client: ' >&2
   if [ -t 0 ]; then
     stty_state="$(stty -g 2>/dev/null || true)"
-    stty -icanon -ixon min 1 time 0 2>/dev/null || true
+    stty -icanon -ixon -echo min 1 time 0 2>/dev/null || true
   fi
 
   creds=""
@@ -352,13 +352,14 @@ read_lexe_credentials() {
   if [ "$read_any" -eq 0 ]; then
     fail "could not read Lexe SDK client credentials"
   fi
-  if [ -n "${char:-}" ] && [ "$char" != $'\n' ] && [ "$char" != $'\r' ]; then
-    if [ -t 0 ]; then
-      printf '\n' >&2
-    fi
+  if [ -t 0 ]; then
+    printf '\n' >&2
   fi
+  creds="${creds//$'\e[200~'/}"
+  creds="${creds//$'\e[201~'/}"
   creds="$(printf '%s' "$creds" | LC_ALL=C tr -d '\r' | trim)"
   [ -n "$creds" ] || fail "Lexe SDK client credentials cannot be empty"
+  say "Read Lexe SDK client credentials (${#creds} characters)."
   printf '%s\n' "$creds"
 }
 
