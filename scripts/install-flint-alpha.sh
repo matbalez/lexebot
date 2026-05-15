@@ -343,7 +343,6 @@ handle_existing_install() {
   say "- ${CONFIG_FILE}"
   install_runner
   normalize_config_channels
-  ensure_config_bot_pubkey
   ensure_config_kudos_bot_pubkey
 
   installed_version="$(installed_config_version)"
@@ -361,6 +360,8 @@ handle_existing_install() {
     start_lexebot
     exit 0
   fi
+
+  ensure_config_bot_pubkey
 
   if [ -n "$(lexebot_pid)" ]; then
     start_lexebot
