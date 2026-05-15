@@ -231,7 +231,6 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let bot_display_name = resolve_bot_display_name(&mut ws, &runtime.config).await;
     let bolt12_offer = runtime.lexe.create_bolt12_offer().await?;
     publish_profile(&mut ws, &runtime.config, &bot_display_name, &bolt12_offer).await?;
-    announce_channel_membership(&mut ws, &runtime.config).await?;
     subscribe_to_channel(&mut ws, &runtime.config.channel_id).await?;
 
     let started_at = nostr::Timestamp::now();
@@ -489,27 +488,6 @@ fn auth_tag_json(tag: &Tag) -> Value {
     )
 }
 
-async fn announce_channel_membership(ws: &mut Ws, config: &Config) -> Result<()> {
-    let builder = EventBuilder::new(
-        Kind::Custom(9000),
-        "",
-        [
-            Tag::parse(&["h", config.channel_id.as_str()])?,
-            Tag::parse(&["p", &config.bot_keys.public_key().to_hex()])?,
-            Tag::parse(&["role", "bot"])?,
-        ],
-    );
-    let event = builder.sign_with_keys(&config.bot_keys)?;
-    let event_id = event.id.to_hex();
-
-    send_json(ws, json!(["EVENT", event])).await?;
-    match wait_for_ok(ws, &event_id).await {
-        Ok(()) => eprintln!("announced {BOT_DISPLAY_NAME} as a channel bot member"),
-        Err(err) => print_membership_help(config, &format!("could not self-add: {err}")),
-    }
-    Ok(())
-}
-
 async fn subscribe_to_channel(ws: &mut Ws, channel_id: &str) -> Result<()> {
     let filter = Filter::new().kind(Kind::Custom(9)).custom_tag(
         SingleLetterTag::lowercase(Alphabet::H),
@@ -563,7 +541,7 @@ fn print_membership_help(config: &Config, reason: &str) {
     );
     eprintln!("Add this bot pubkey to the channel, then restart LexeBot:");
     eprintln!("  bot pubkey: {bot_pubkey}");
-    eprintln!("  sprout add-channel-member \\");
+    eprintln!("  sprout channels add-member \\");
     eprintln!("    --channel {} \\", config.channel_id);
     eprintln!("    --pubkey {bot_pubkey} \\");
     eprintln!("    --role bot");

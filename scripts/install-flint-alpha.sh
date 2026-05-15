@@ -4,7 +4,7 @@ set -euo pipefail
 CHANNEL_ID="1df37399-3c25-4019-8bc7-faacd53587d0"
 RELAY_WS_URL="wss://sprout.up.railway.app"
 RELAY_HTTP_URL="https://sprout.up.railway.app"
-LEXEBOT_VERSION="v0.1.3"
+LEXEBOT_VERSION="v0.1.4"
 LEXEBOT_ARCHIVE="lexebot-${LEXEBOT_VERSION}-aarch64-apple-darwin.tar.gz"
 LEXEBOT_RELEASE_BASE="https://github.com/matbalez/lexebot/releases/download/${LEXEBOT_VERSION}"
 RUNNER_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/run-flint-alpha.sh"

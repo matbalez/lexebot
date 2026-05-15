@@ -38,13 +38,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.3-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.3/lexebot-v0.1.3-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.3-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.3/lexebot-v0.1.3-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.3-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.4-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.4/lexebot-v0.1.4-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.4-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.4/lexebot-v0.1.4-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.4-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.3-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.4-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
@@ -74,6 +74,18 @@ rerun, it detects an existing local install and asks whether to start that
 existing bot instead of generating a new identity. LexeBot derives the owner
 display name from the owner's public Sprout profile on startup and publishes
 the bot profile as `LexeBot[<owner display name without spaces>]`.
+
+After the first install, start LexeBot from any directory with:
+
+```bash
+run-lexebot-flint-alpha
+```
+
+If `~/.local/bin` is not on your `PATH`, use this from any directory instead:
+
+```bash
+bash ~/.local/bin/run-lexebot-flint-alpha
+```
 
 ### From Source
 
@@ -143,14 +155,14 @@ from that Kudos bot:
 The command only executes when `<sender-pubkey>` is this LexeBot's configured
 owner. Normal wallet commands still require the owner pubkey.
 
-If startup logs say the bot could not self-add as a channel member, add the
-printed bot pubkey to the channel as a bot using a Sprout identity allowed to
-add members. In Flint Alpha, Steve and DK can run this themselves if they have
-admin privileges.
+If startup logs say LexeBot is authenticated but is not a channel member, add
+the printed bot pubkey to the channel as a bot using a Sprout identity allowed
+to add members. In Flint Alpha, Steve and DK can run this themselves if they
+have admin privileges.
 
 ```bash
 SPROUT_PRIVATE_KEY=<your-existing-sprout-nsec-or-hex-secret> \
-sprout add-channel-member \
+sprout channels add-member \
   --channel <channel-uuid> \
   --pubkey <lexebot-pubkey-hex> \
   --role bot
@@ -164,7 +176,7 @@ cd /Users/mattyb/.sprout/REPOS/sprout
 SPROUT_PRIVATE_KEY=<your-existing-sprout-nsec-or-hex-secret> \
 cargo run -p sprout-cli -- \
   --relay wss://sprout.up.railway.app \
-  add-channel-member \
+  channels add-member \
   --channel <channel-uuid> \
   --pubkey <lexebot-pubkey-hex> \
   --role bot
@@ -200,7 +212,7 @@ The next packaging step should be a small `lexebot init` flow that:
 - generates a Sprout bot key
 - derives the owner's Sprout pubkey from the owner auth material
 - writes a local `.env` file outside the repo
-- prints the exact `sprout add-channel-member` command for the bot pubkey
+- prints the exact `sprout channels add-member` command for the bot pubkey
 - never stores or uploads Lexe client credentials anywhere except the user's
   local machine
 
