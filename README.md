@@ -84,6 +84,20 @@ If the installer is newer than the local installed version, rerunning the
 installer upgrades the binary and runner while preserving the existing local
 config and bot identity.
 
+If you do not want the installer to use or build Sprout CLI to add the bot to
+the channel, use manual-add mode:
+
+```bash
+LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' \
+  bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh) --manual-add
+```
+
+Manual-add mode installs LexeBot, writes local config, prints the LexeBot pubkey
+for a channel admin to add as role `bot`, and exits without starting LexeBot.
+Start LexeBot only after the channel admin confirms the bot pubkey was added;
+otherwise the relay will reject channel subscriptions because the bot is not a
+member yet.
+
 After the first install, start LexeBot from any directory with:
 
 ```bash

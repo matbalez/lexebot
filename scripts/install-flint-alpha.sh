@@ -27,6 +27,7 @@ LEGACY_SPROUT_IDENTITY_KEY="${HOME}/Library/Application Support/com.wesb.sprout/
 SPROUT_REPO_DIR="${HOME}/.cache/lexebot/sprout"
 SPROUT_CLI_PATH="${SPROUT_CLI_PATH:-}"
 LEXEBOT_DOWNLOAD_TMPDIR=""
+MANUAL_ADD=0
 
 cleanup() {
   if [ -n "${LEXEBOT_DOWNLOAD_TMPDIR:-}" ] && [ -d "$LEXEBOT_DOWNLOAD_TMPDIR" ]; then
@@ -47,6 +48,37 @@ fail() {
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
+}
+
+usage() {
+  cat >&2 <<EOF
+Usage:
+  install.sh [--manual-add]
+
+Options:
+  --manual-add   Do not use or build Sprout CLI to add LexeBot to the channel.
+                 Print the LexeBot pubkey for a channel admin to add manually,
+                 then exit without starting LexeBot.
+EOF
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --manual-add)
+        MANUAL_ADD=1
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        usage
+        fail "unknown argument: $1"
+        ;;
+    esac
+    shift
+  done
 }
 
 start_command() {
@@ -76,6 +108,34 @@ list_channels_command() {
 print_start_command() {
   say "Future start command:"
   say "$(start_command)"
+}
+
+print_manual_add_instructions() {
+  local bot_pubkey="$1"
+
+  say
+  say "Manual channel add requested."
+  say "Ask a Flint Alpha channel admin to add this LexeBot pubkey as role bot:"
+  say
+  say "  ${bot_pubkey}"
+  say
+  say "Admin command, if they have Sprout CLI:"
+  say "  sprout channels add-member \\"
+  say "    --channel ${DEFAULT_CHANNEL_ID} \\"
+  say "    --pubkey ${bot_pubkey} \\"
+  say "    --role bot"
+  say
+  say "After the admin confirms the bot was added, start LexeBot with:"
+  say "  $(start_command)"
+}
+
+configured_bot_pubkey() {
+  [ -f "$CONFIG_FILE" ] || return 1
+  (
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    printf '%s\n' "${SPROUT_BOT_PUBKEY:-}"
+  ) | trim
 }
 
 lexebot_pid() {
@@ -331,7 +391,7 @@ start_lexebot() {
 }
 
 handle_existing_install() {
-  local installed_version
+  local installed_version bot_pubkey
 
   if ! existing_install_present; then
     return 0
@@ -357,11 +417,24 @@ handle_existing_install() {
     ensure_config_bot_pubkey
     ensure_config_kudos_bot_pubkey
     say "Upgraded existing LexeBot install to ${LEXEBOT_VERSION}."
+    if [ "$MANUAL_ADD" -eq 1 ]; then
+      bot_pubkey="$(configured_bot_pubkey)"
+      [ -n "$bot_pubkey" ] || fail "could not determine LexeBot pubkey from ${CONFIG_FILE}"
+      print_manual_add_instructions "$bot_pubkey"
+      exit 0
+    fi
     start_lexebot
     exit 0
   fi
 
   ensure_config_bot_pubkey
+
+  if [ "$MANUAL_ADD" -eq 1 ]; then
+    bot_pubkey="$(configured_bot_pubkey)"
+    [ -n "$bot_pubkey" ] || fail "could not determine LexeBot pubkey from ${CONFIG_FILE}"
+    print_manual_add_instructions "$bot_pubkey"
+    exit 0
+  fi
 
   if [ -n "$(lexebot_pid)" ]; then
     start_lexebot
@@ -630,6 +703,8 @@ sprout_add_bot_to_channel() {
 }
 
 main() {
+  parse_args "$@"
+
   need_cmd awk
   need_cmd sed
 
@@ -649,9 +724,18 @@ main() {
   bot_pubkey="$(printf '%s\n' "$generated" | sed -n '1p')"
   bot_nsec="$(printf '%s\n' "$generated" | sed -n '2p')"
   lexe_credentials="$(read_lexe_credentials)"
-  sprout_cli="$(ensure_sprout_cli)"
 
   write_config "$owner_key" "$bot_pubkey" "$bot_nsec" "$lexe_credentials"
+
+  if [ "$MANUAL_ADD" -eq 1 ]; then
+    say
+    say "Install complete."
+    say "Default channel configured: ${DEFAULT_CHANNEL_NAME} (${DEFAULT_CHANNEL_ID})"
+    print_manual_add_instructions "$bot_pubkey"
+    exit 0
+  fi
+
+  sprout_cli="$(ensure_sprout_cli)"
   sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey"
 
   say
