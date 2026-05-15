@@ -362,40 +362,10 @@ read_lexe_credentials() {
   printf '%s\n' "$creds"
 }
 
-read_owner_display_name() {
-  local default_name owner_name
-
-  if [ -n "${LEXEBOT_OWNER_DISPLAY_NAME:-}" ]; then
-    owner_name="$(printf '%s' "$LEXEBOT_OWNER_DISPLAY_NAME" | trim)"
-    [ -n "$owner_name" ] || fail "LEXEBOT_OWNER_DISPLAY_NAME cannot be empty"
-    printf '%s\n' "$owner_name"
-    return 0
-  fi
-
-  default_name="$(id -un 2>/dev/null || printf 'owner')"
-  say "LexeBot will publish a bot profile named LexeBot[USERNAME]."
-  printf 'USERNAME [%s]: ' "$default_name" >&2
-  IFS= read -r owner_name
-  owner_name="$(printf '%s' "$owner_name" | trim)"
-  [ -n "$owner_name" ] || owner_name="$default_name"
-  printf '%s\n' "$owner_name"
-}
-
-bot_display_name() {
-  local owner_name="$1" compact
-  compact="$(printf '%s' "$owner_name" | LC_ALL=C tr -d '[:space:][:cntrl:]' | cut -c 1-80)"
-  if [ -n "$compact" ]; then
-    printf 'LexeBot[%s]\n' "$compact"
-  else
-    printf 'LexeBot\n'
-  fi
-}
-
 write_config() {
   local owner_key="$1"
   local bot_nsec="$2"
-  local owner_display_name="$3"
-  local lexe_credentials="$4"
+  local lexe_credentials="$3"
 
   mkdir -p "$CONFIG_DIR"
   umask 077
@@ -406,40 +376,12 @@ write_config() {
     printf 'SPROUT_OWNER_PRIVATE_KEY=%s\n' "$(shell_quote "$owner_key")"
     printf 'SPROUT_BOT_PRIVATE_KEY=%s\n' "$(shell_quote "$bot_nsec")"
     printf 'SPROUT_BOT_AUTH_MODE=%s\n' "$(shell_quote "owner-attested")"
-    printf 'LEXEBOT_OWNER_DISPLAY_NAME=%s\n' "$(shell_quote "$owner_display_name")"
     printf 'LEXE_CLIENT_CREDENTIALS=%s\n' "$(shell_quote "$lexe_credentials")"
     printf 'LEXEBOT_BIN=%s\n' "$(shell_quote "$LEXEBOT_BIN")"
     printf 'LEXEBOT_VERSION=%s\n' "$(shell_quote "$LEXEBOT_VERSION")"
   } >"$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
   say "Wrote ${CONFIG_FILE}"
-}
-
-sprout_set_profile() {
-  local sprout_cli="$1"
-  local bot_nsec="$2"
-  local display_name="$3"
-
-  say "Publishing LexeBot profile as ${display_name}..."
-  if "$sprout_cli" users set-profile --help >/dev/null 2>&1; then
-    SPROUT_PRIVATE_KEY="$bot_nsec" "$sprout_cli" \
-      --relay "$RELAY_HTTP_URL" \
-      users set-profile \
-      --name "$display_name" \
-      --about "Local Lexe wallet bot for Sprout"
-    return 0
-  fi
-
-  if "$sprout_cli" set-profile --help >/dev/null 2>&1; then
-    SPROUT_PRIVATE_KEY="$bot_nsec" "$sprout_cli" \
-      --relay "$RELAY_HTTP_URL" \
-      set-profile \
-      --name "$display_name" \
-      --about "Local Lexe wallet bot for Sprout"
-    return 0
-  fi
-
-  fail "Sprout CLI at ${sprout_cli} does not support profile publishing"
 }
 
 sprout_add_bot_to_channel() {
@@ -483,7 +425,7 @@ main() {
   install_runner
 
   local owner_key_file owner_key bot_pubkey bot_nsec lexe_credentials generated
-  local owner_display_name display_name sprout_cli
+  local sprout_cli
   owner_key_file="$(find_owner_key_file)" || fail "Sprout identity key not found. Launch Sprout once, then rerun this installer."
   owner_key="$(read_secret_file "$owner_key_file")" || fail "could not read ${owner_key_file}"
   [ -n "$owner_key" ] || fail "Sprout identity key is empty"
@@ -492,12 +434,9 @@ main() {
   bot_pubkey="$(printf '%s\n' "$generated" | sed -n '1p')"
   bot_nsec="$(printf '%s\n' "$generated" | sed -n '2p')"
   lexe_credentials="$(read_lexe_credentials)"
-  owner_display_name="$(read_owner_display_name)"
-  display_name="$(bot_display_name "$owner_display_name")"
   sprout_cli="$(ensure_sprout_cli)"
 
-  sprout_set_profile "$sprout_cli" "$bot_nsec" "$display_name"
-  write_config "$owner_key" "$bot_nsec" "$owner_display_name" "$lexe_credentials"
+  write_config "$owner_key" "$bot_nsec" "$lexe_credentials"
   sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey"
 
   say

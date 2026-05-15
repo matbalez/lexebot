@@ -69,7 +69,9 @@ at `~/.local/bin/run-lexebot-flint-alpha`, and adds the bot to Flint Alpha as
 role `bot` using the invoking user's admin identity. On a fresh install, it
 starts LexeBot in the background and prints the command to start it later. On
 rerun, it detects an existing local install and asks whether to start that
-existing bot instead of generating a new identity.
+existing bot instead of generating a new identity. LexeBot derives the owner
+display name from the owner's public Sprout profile on startup and publishes
+the bot profile as `LexeBot[<owner display name without spaces>]`.
 
 ### From Source
 
