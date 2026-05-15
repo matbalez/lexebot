@@ -10,11 +10,13 @@ LEXEBOT_ARCHIVE="lexebot-${LEXEBOT_VERSION}-aarch64-apple-darwin.tar.gz"
 LEXEBOT_RELEASE_BASE="https://github.com/matbalez/lexebot/releases/download/${LEXEBOT_VERSION}"
 RUNNER_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/run.sh"
 ADD_CHANNEL_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/add-channel.sh"
+LIST_CHANNELS_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/list-channels.sh"
 
 INSTALL_DIR="${HOME}/.local/bin"
 LEXEBOT_BIN="${INSTALL_DIR}/lexebot"
 RUNNER_BIN="${INSTALL_DIR}/run-lexebot"
 ADD_CHANNEL_BIN="${INSTALL_DIR}/lexebot-add-channel"
+LIST_CHANNELS_BIN="${INSTALL_DIR}/lexebot-list-channels"
 LEGACY_RUNNER_BIN="${INSTALL_DIR}/run-lexebot-flint-alpha"
 CONFIG_DIR="${HOME}/.config/lexebot"
 CONFIG_FILE="${CONFIG_DIR}/lexebot.env"
@@ -59,6 +61,14 @@ add_channel_command() {
     printf 'lexebot-add-channel <channel-uuid>\n'
   else
     printf 'bash %s <channel-uuid>\n' "$ADD_CHANNEL_BIN"
+  fi
+}
+
+list_channels_command() {
+  if command -v lexebot-list-channels >/dev/null 2>&1; then
+    printf 'lexebot-list-channels\n'
+  else
+    printf 'bash %s\n' "$LIST_CHANNELS_BIN"
   fi
 }
 
@@ -445,10 +455,11 @@ download_lexebot() {
 }
 
 install_runner() {
-  local script_dir local_runner local_add_channel
+  local script_dir local_runner local_add_channel local_list_channels
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
   local_runner="${script_dir}/run.sh"
   local_add_channel="${script_dir}/add-channel.sh"
+  local_list_channels="${script_dir}/list-channels.sh"
   mkdir -p "$INSTALL_DIR"
 
   if [ -f "$local_runner" ]; then
@@ -470,6 +481,16 @@ install_runner() {
   fi
 
   say "Installed channel helper ${ADD_CHANNEL_BIN}"
+
+  if [ -f "$local_list_channels" ]; then
+    install -m 700 "$local_list_channels" "$LIST_CHANNELS_BIN"
+  else
+    need_cmd curl
+    curl -fL -o "$LIST_CHANNELS_BIN" "$LIST_CHANNELS_URL"
+    chmod 700 "$LIST_CHANNELS_BIN"
+  fi
+
+  say "Installed channel list helper ${LIST_CHANNELS_BIN}"
 
   cat >"$LEGACY_RUNNER_BIN" <<EOF
 #!/usr/bin/env bash
@@ -596,6 +617,8 @@ main() {
   say
   say "Install complete."
   say "Default channel configured: ${DEFAULT_CHANNEL_NAME} (${DEFAULT_CHANNEL_ID})"
+  say "List available channels with:"
+  say "$(list_channels_command)"
   say "Add another channel later with:"
   say "$(add_channel_command)"
   start_lexebot

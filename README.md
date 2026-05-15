@@ -67,7 +67,8 @@ the local Sprout owner key from `~/Library/Application Support/xyz.block.sprout.
 reads the Lexe SDK client credentials from `LEXE_CLIENT_CREDENTIALS`, stores the local run config in
 `~/.config/lexebot/lexebot.env` with file mode `600`, installs the runner at
 `~/.local/bin/run-lexebot`, installs the channel helper at
-`~/.local/bin/lexebot-add-channel`, and adds the bot to Flint Alpha as role
+`~/.local/bin/lexebot-add-channel`, installs the channel listing helper at
+`~/.local/bin/lexebot-list-channels`, and adds the bot to Flint Alpha as role
 `bot` using the invoking user's admin identity. On a fresh install, it prints
 the command to start LexeBot later, then runs LexeBot in the foreground in the
 current terminal so startup logs are visible. On rerun, it detects an existing
@@ -101,11 +102,17 @@ Then restart LexeBot with `run-lexebot`. The helper adds the bot pubkey to the
 channel as role `bot` and appends the channel UUID to
 `~/.config/lexebot/lexebot.env`.
 
-Until Sprout exposes a copy button for channel UUIDs in the UI, use the Sprout
-CLI to list channels and copy the target `id`/UUID:
+Until Sprout exposes a copy button for channel UUIDs in the UI, use the
+installed helper to list channels and copy the target `id`/UUID:
 
 ```bash
-sprout list-channels --member
+lexebot-list-channels
+```
+
+If `~/.local/bin` is not on your `PATH`, use this from any directory instead:
+
+```bash
+bash ~/.local/bin/lexebot-list-channels
 ```
 
 ### From Source
