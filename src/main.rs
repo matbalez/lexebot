@@ -657,6 +657,7 @@ async fn maybe_reply(
         return Ok(());
     };
 
+    let is_control_channel = is_control_channel(&runtime.config, channel_id);
     let mut reply_mentions = reply_mentions(event, &runtime.config);
     let reply = match parse_command(&event.content) {
         Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => {
@@ -689,7 +690,7 @@ async fn maybe_reply(
                 return Ok(());
             }
             match runtime.lexe.execute(command).await {
-                Ok(Some(private_body)) if private_ack.is_some() => {
+                Ok(Some(private_body)) if private_ack.is_some() && !is_control_channel => {
                     match send_dm_message(
                         ws,
                         &runtime.config,
@@ -827,12 +828,10 @@ fn install_welcome_message() -> String {
     format!(
         "LexeBot v{} is installed and ready.\n\n\
 Supported commands:\n\
-@LexeBot get balance\n\
-@LexeBot get BOLT12\n\
-@LexeBot create invoice for ₿1,000\n\
-@LexeBot send ₿500 to <payment-target>\n\n\
-Auto-kudos runs in the background when Kudos is configured. \
-LexeBot does not need to be added to work channels for auto-kudos.",
+get balance\n\
+get BOLT12\n\
+create invoice for ₿1,000\n\
+send ₿500 to <payment-target>",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -984,16 +983,17 @@ impl BotCommand {
 
 fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
     let tokens = content.split_whitespace().collect::<Vec<_>>();
-    if !content.trim_start().starts_with('@') {
-        return Err(command_help());
-    }
-
-    let Some(mention_end_index) = tokens.iter().position(|token| is_bot_mention_token(token))
-    else {
-        return Err(command_help());
+    let command_start_index = if content.trim_start().starts_with('@') {
+        let Some(mention_end_index) = tokens.iter().position(|token| is_bot_mention_token(token))
+        else {
+            return Err(command_help());
+        };
+        mention_end_index + 1
+    } else {
+        0
     };
     let [command, rest @ ..] = tokens
-        .get(mention_end_index + 1..)
+        .get(command_start_index..)
         .filter(|tokens| !tokens.is_empty())
         .ok_or_else(command_help)?
     else {
@@ -1034,7 +1034,7 @@ fn parse_get_command(tokens: &[&str]) -> std::result::Result<BotCommand, String>
     match tokens {
         ["balance"] => Ok(BotCommand::GetBalance),
         [offer] if offer.eq_ignore_ascii_case("bolt12") => Ok(BotCommand::GetBolt12),
-        _ => Err("expected `@LexeBot get balance` or `@LexeBot get BOLT12`".to_string()),
+        _ => Err("expected `get balance` or `get BOLT12`".to_string()),
     }
 }
 
@@ -1043,7 +1043,7 @@ fn parse_create_command(tokens: &[&str]) -> std::result::Result<BotCommand, Stri
         ["invoice", "for", amount] => Ok(BotCommand::CreateInvoice {
             amount: parse_amount_token(amount)?,
         }),
-        _ => Err("expected `@LexeBot create invoice for ₿1,000`".to_string()),
+        _ => Err("expected `create invoice for ₿1,000`".to_string()),
     }
 }
 
@@ -1053,7 +1053,7 @@ fn parse_send_command(tokens: &[&str]) -> std::result::Result<BotCommand, String
             amount: parse_amount_token(amount)?,
             payable: (*payable).to_string(),
         }),
-        _ => Err("expected `@LexeBot send ₿500 to <payment-target>`".to_string()),
+        _ => Err("expected `send ₿500 to <payment-target>`".to_string()),
     }
 }
 
@@ -1075,7 +1075,7 @@ fn parse_auto_kudos_command(tokens: &[&str]) -> std::result::Result<BotCommand, 
 }
 
 fn command_help() -> String {
-    "use `@LexeBot get balance`, `@LexeBot get BOLT12`, `@LexeBot create invoice for ₿1,000`, or `@LexeBot send ₿500 to <payment-target>`; personalized names like `@LexeBot[Mat]` work too".to_string()
+    "use `get balance`, `get BOLT12`, `create invoice for ₿1,000`, or `send ₿500 to <payment-target>`; explicit mentions like `@LexeBot get balance` work too".to_string()
 }
 
 fn parse_amount_token(token: &str) -> std::result::Result<u64, String> {
@@ -1134,9 +1134,13 @@ fn event_addresses_bot(event: &Event, config: &Config) -> bool {
     if event_mentions_bot(event, config) {
         return true;
     }
-    event.kind == Kind::Custom(9)
-        && event_channel_id(event, config).is_some()
-        && text_addresses_bot(&event.content)
+    if event.kind != Kind::Custom(9) {
+        return false;
+    }
+    let Some(channel_id) = event_channel_id(event, config) else {
+        return false;
+    };
+    is_control_channel(config, channel_id) || text_addresses_bot(&event.content)
 }
 
 fn text_addresses_bot(content: &str) -> bool {
@@ -1159,6 +1163,13 @@ fn event_channel_id<'a>(event: &'a Event, config: &Config) -> Option<&'a str> {
             .any(|configured| configured == channel_id)
             .then_some(channel_id)
     })
+}
+
+fn is_control_channel(config: &Config, channel_id: &str) -> bool {
+    config
+        .channel_ids
+        .first()
+        .is_some_and(|configured| configured == channel_id)
 }
 
 fn reply_mentions(event: &Event, config: &Config) -> Vec<String> {
@@ -1510,6 +1521,7 @@ mod tests {
 
     #[test]
     fn parses_balance_command() {
+        assert_eq!(parse_command("get balance"), Ok(BotCommand::GetBalance));
         assert_eq!(
             parse_command("@LexeBot get balance"),
             Ok(BotCommand::GetBalance)
@@ -1526,6 +1538,7 @@ mod tests {
 
     #[test]
     fn parses_bolt12_command() {
+        assert_eq!(parse_command("get BOLT12"), Ok(BotCommand::GetBolt12));
         assert_eq!(
             parse_command("@LexeBot get BOLT12"),
             Ok(BotCommand::GetBolt12)
@@ -1539,6 +1552,10 @@ mod tests {
     #[test]
     fn parses_create_invoice_command() {
         assert_eq!(
+            parse_command("create invoice for ₿1,000"),
+            Ok(BotCommand::CreateInvoice { amount: 1_000 })
+        );
+        assert_eq!(
             parse_command("@lexebot create invoice for ₿1,000"),
             Ok(BotCommand::CreateInvoice { amount: 1_000 })
         );
@@ -1546,6 +1563,13 @@ mod tests {
 
     #[test]
     fn parses_send_command() {
+        assert_eq!(
+            parse_command("send ₿500 to lno1abc"),
+            Ok(BotCommand::Send {
+                amount: 500,
+                payable: "lno1abc".to_string()
+            })
+        );
         assert_eq!(
             parse_command("@lexebot send ₿500 to lno1abc"),
             Ok(BotCommand::Send {
@@ -1662,6 +1686,38 @@ mod tests {
 
         assert!(!event_mentions_bot(&event, &config));
         assert!(event_addresses_bot(&event, &config));
+    }
+
+    #[test]
+    fn bare_command_only_triggers_in_control_channel() {
+        let bot_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let control_event = EventBuilder::new(
+            Kind::Custom(9),
+            "get balance",
+            [Tag::parse(&["h", "control-channel"]).unwrap()],
+        )
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+        let other_event = EventBuilder::new(
+            Kind::Custom(9),
+            "get balance",
+            [Tag::parse(&["h", "other-channel"]).unwrap()],
+        )
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["control-channel".to_string(), "other-channel".to_string()],
+            bot_keys,
+            owner_pubkey: owner_keys.public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: None,
+        };
+
+        assert!(event_addresses_bot(&control_event, &config));
+        assert!(!event_addresses_bot(&other_event, &config));
     }
 
     #[test]
