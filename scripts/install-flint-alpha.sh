@@ -600,14 +600,18 @@ download_lexebot() {
 }
 
 install_runner() {
-  local script_dir local_runner local_add_channel local_list_channels
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd || true)"
-  local_runner="${script_dir}/run.sh"
-  local_add_channel="${script_dir}/add-channel.sh"
-  local_list_channels="${script_dir}/list-channels.sh"
+  local script_source script_dir local_runner local_add_channel local_list_channels
+  script_source="${BASH_SOURCE[0]-}"
+  script_dir=""
+  if [ -n "$script_source" ] && [ "$script_source" != "bash" ] && [ "$script_source" != "-" ]; then
+    script_dir="$(cd "$(dirname "$script_source")" >/dev/null 2>&1 && pwd || true)"
+  fi
+  local_runner="${script_dir:+${script_dir}/run.sh}"
+  local_add_channel="${script_dir:+${script_dir}/add-channel.sh}"
+  local_list_channels="${script_dir:+${script_dir}/list-channels.sh}"
   mkdir -p "$INSTALL_DIR"
 
-  if [ -f "$local_runner" ]; then
+  if [ -n "$local_runner" ] && [ -f "$local_runner" ]; then
     install -m 700 "$local_runner" "$RUNNER_BIN"
   else
     need_cmd curl
@@ -617,7 +621,7 @@ install_runner() {
 
   say "Installed runner ${RUNNER_BIN}"
 
-  if [ -f "$local_add_channel" ]; then
+  if [ -n "$local_add_channel" ] && [ -f "$local_add_channel" ]; then
     install -m 700 "$local_add_channel" "$ADD_CHANNEL_BIN"
   else
     need_cmd curl
@@ -627,7 +631,7 @@ install_runner() {
 
   say "Installed channel helper ${ADD_CHANNEL_BIN}"
 
-  if [ -f "$local_list_channels" ]; then
+  if [ -n "$local_list_channels" ] && [ -f "$local_list_channels" ]; then
     install -m 700 "$local_list_channels" "$LIST_CHANNELS_BIN"
   else
     need_cmd curl
