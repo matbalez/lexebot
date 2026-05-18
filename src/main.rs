@@ -18,7 +18,9 @@ use nostr::bitcoin::hashes::sha256::Hash as Sha256Hash;
 use nostr::bitcoin::hashes::Hash;
 use nostr::bitcoin::secp256k1::schnorr::Signature;
 use nostr::bitcoin::secp256k1::{Message as SecpMessage, XOnlyPublicKey};
+use nostr::event::unsigned::UnsignedEvent;
 use nostr::nips::nip44::{self, Version as Nip44Version};
+use nostr::nips::nip59;
 use nostr::{
     Alphabet, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, SingleLetterTag, Tag,
     ToBech32, Url, SECP256K1,
@@ -30,10 +32,13 @@ use url::Url as WsUrl;
 const DEFAULT_RELAY_URL: &str = "ws://localhost:3000";
 const SUBSCRIPTION_ID: &str = "lexebot";
 const AUTO_KUDOS_SUBSCRIPTION_ID: &str = "lexebot-auto-kudos";
+const OWNER_DM_SUBSCRIPTION_ID: &str = "lexebot-owner-dm";
 const OWNER_PROFILE_SUBSCRIPTION_ID: &str = "lexebot-owner-profile";
 const AUTO_KUDOS_COMMAND_KIND: u16 = 21_000;
 const AUTO_KUDOS_RESULT_KIND: u16 = 21_001;
 const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
+const NIP17_GIFT_WRAP_KIND: u16 = 1_059;
+const NIP17_PRIVATE_DM_RUMOR_KIND: u16 = 14;
 const PRESENCE_UPDATE_KIND: u16 = 20_001;
 const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DM_OPEN_KIND: u16 = 41_010;
@@ -253,6 +258,7 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     publish_profile(&mut ws, &runtime.config, &bot_display_name, &bolt12_offer).await?;
     publish_presence(&mut ws, &runtime.config, "online").await?;
     subscribe_to_channels(&mut ws, &runtime.config.channel_ids).await?;
+    subscribe_to_owner_dm_inbox(&mut ws, &runtime.config).await?;
     subscribe_to_auto_kudos_inbox(&mut ws, &runtime.config).await?;
 
     let started_at = nostr::Timestamp::now();
@@ -261,7 +267,7 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     presence_interval.tick().await;
 
     eprintln!(
-        "listening in {} channel(s) for @LexeBot commands: {}",
+        "listening for encrypted owner DM commands and {} configured channel(s): {}",
         runtime.config.channel_ids.len(),
         runtime.config.channel_ids.join(", ")
     );
@@ -437,6 +443,11 @@ fn build_profile(config: &Config, display_name: &str, bolt12_offer: &str) -> Eve
                     "command_kind": AUTO_KUDOS_COMMAND_KIND,
                     "result_kind": AUTO_KUDOS_RESULT_KIND,
                 },
+                "manual_commands": {
+                    "encrypted": "nip59-gift-wrap",
+                    "gift_wrap_kind": NIP17_GIFT_WRAP_KIND,
+                    "rumor_kind": NIP17_PRIVATE_DM_RUMOR_KIND,
+                },
             },
         })
         .to_string(),
@@ -564,6 +575,14 @@ async fn subscribe_to_auto_kudos_inbox(ws: &mut Ws, config: &Config) -> Result<(
     send_json(ws, json!(["REQ", AUTO_KUDOS_SUBSCRIPTION_ID, filter])).await
 }
 
+async fn subscribe_to_owner_dm_inbox(ws: &mut Ws, config: &Config) -> Result<()> {
+    let bot_pubkey = config.bot_keys.public_key().to_hex();
+    let filter = Filter::new()
+        .kind(Kind::GiftWrap)
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), [bot_pubkey]);
+    send_json(ws, json!(["REQ", OWNER_DM_SUBSCRIPTION_ID, filter])).await
+}
+
 async fn subscribe_to_channel(ws: &mut Ws, channel_id: &str) -> Result<()> {
     let filter = Filter::new()
         .kinds([Kind::Custom(9), Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND)])
@@ -643,6 +662,13 @@ async fn maybe_reply(
     started_at: nostr::Timestamp,
     event: &Event,
 ) -> Result<()> {
+    if event.kind == Kind::GiftWrap {
+        if event.created_at >= started_at && event_mentions_bot(event, &runtime.config) {
+            handle_encrypted_owner_dm(ws, runtime, event).await?;
+        }
+        return Ok(());
+    }
+
     if event.pubkey == runtime.config.bot_keys.public_key() || event.created_at < started_at {
         return Ok(());
     }
@@ -766,6 +792,37 @@ async fn handle_encrypted_auto_kudos(ws: &mut Ws, runtime: &Runtime, event: &Eve
     Ok(())
 }
 
+async fn handle_encrypted_owner_dm(ws: &mut Ws, runtime: &Runtime, event: &Event) -> Result<()> {
+    let command_event_id = event.id.to_hex();
+    let plaintext = match encrypted_owner_dm_plaintext(&runtime.config, event).await {
+        Ok(plaintext) => plaintext,
+        Err(err) => {
+            eprintln!("ignored encrypted owner DM {command_event_id}: {err:#}");
+            return Ok(());
+        }
+    };
+
+    let reply = match parse_command(&plaintext) {
+        Ok(command)
+            if command_authorized(&command, runtime.config.owner_pubkey, &runtime.config) =>
+        {
+            match runtime.lexe.execute(command).await {
+                Ok(Some(reply)) => reply,
+                Ok(None) => return Ok(()),
+                Err(err) => format!("Lexe command failed: {err:#}"),
+            }
+        }
+        Ok(_) => {
+            "Only this LexeBot's configured owner can use encrypted owner DM commands.".to_string()
+        }
+        Err(err) => format!("Invalid LexeBot command: {err}"),
+    };
+
+    send_encrypted_owner_dm_message(ws, &runtime.config, &reply).await?;
+    eprintln!("replied to encrypted owner DM {command_event_id}");
+    Ok(())
+}
+
 async fn send_auto_kudos_result(
     ws: &mut Ws,
     config: &Config,
@@ -807,6 +864,15 @@ async fn send_dm_message(
     send_json(ws, json!(["EVENT", event])).await?;
     wait_for_ok(ws, &event_id).await?;
     Ok(())
+}
+
+async fn send_encrypted_owner_dm_message(
+    ws: &mut Ws,
+    config: &Config,
+    content: &str,
+) -> Result<()> {
+    let event = build_private_dm_gift_wrap(&config.bot_keys, config.owner_pubkey, content).await?;
+    send_json(ws, json!(["EVENT", event])).await
 }
 
 async fn send_install_welcome_once(config: &Config, channel_id: &str) -> Result<()> {
@@ -930,6 +996,58 @@ fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCom
         amount,
         payable,
     })
+}
+
+async fn encrypted_owner_dm_plaintext(config: &Config, event: &Event) -> Result<String> {
+    let unwrapped = nip59::extract_rumor(&config.bot_keys, event).await?;
+
+    if unwrapped.sender != config.owner_pubkey {
+        bail!("gift wrap sender is not the configured owner");
+    }
+    if unwrapped.rumor.pubkey != config.owner_pubkey {
+        bail!("gift wrap rumor author is not the configured owner");
+    }
+    if unwrapped.rumor.kind != Kind::PrivateDirectMessage {
+        bail!("gift wrap rumor is not a private direct message");
+    }
+    if !rumor_mentions_pubkey(&unwrapped.rumor, config.bot_keys.public_key()) {
+        bail!("gift wrap rumor is not addressed to this LexeBot");
+    }
+
+    Ok(unwrapped.rumor.content)
+}
+
+async fn build_private_dm_gift_wrap(
+    sender_keys: &Keys,
+    recipient: PublicKey,
+    content: &str,
+) -> Result<Event> {
+    let rumor: UnsignedEvent =
+        EventBuilder::private_msg_rumor(recipient, content, None).build(sender_keys.public_key());
+    build_gift_wrap_with_current_timestamp(sender_keys, recipient, rumor).await
+}
+
+async fn build_gift_wrap_with_current_timestamp(
+    sender_keys: &Keys,
+    recipient: PublicKey,
+    rumor: UnsignedEvent,
+) -> Result<Event> {
+    let seal = EventBuilder::seal(sender_keys, &recipient, rumor)
+        .await?
+        .sign_with_keys(sender_keys)?;
+    let wrapper_keys = Keys::generate();
+    let encrypted = nip44::encrypt(
+        wrapper_keys.secret_key(),
+        &recipient,
+        seal.as_json(),
+        Nip44Version::default(),
+    )?;
+    Ok(EventBuilder::new(
+        Kind::GiftWrap,
+        encrypted,
+        [Tag::parse(&["p", &recipient.to_hex()])?],
+    )
+    .sign_with_keys(&wrapper_keys)?)
 }
 
 fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result<EventBuilder> {
@@ -1131,12 +1249,24 @@ fn event_mentions_bot(event: &Event, config: &Config) -> bool {
 }
 
 fn event_addresses_bot(event: &Event, config: &Config) -> bool {
+    if event.kind == Kind::GiftWrap {
+        return event_mentions_bot(event, config);
+    }
     if event.kind == Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND) {
         return event_mentions_bot(event, config);
     }
     event.kind == Kind::Custom(9)
         && event_channel_id(event, config)
             .is_some_and(|channel_id| is_control_channel(config, channel_id))
+}
+
+fn rumor_mentions_pubkey(rumor: &UnsignedEvent, pubkey: PublicKey) -> bool {
+    let pubkey = pubkey.to_hex();
+    rumor.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.first().map(String::as_str) == Some("p")
+            && parts.get(1).map(String::as_str) == Some(pubkey.as_str())
+    })
 }
 
 fn event_channel_id<'a>(event: &'a Event, config: &Config) -> Option<&'a str> {
@@ -1742,6 +1872,81 @@ mod tests {
         };
 
         assert!(event_addresses_bot(&event, &config));
+    }
+
+    #[test]
+    fn encrypted_owner_dm_uses_bot_gift_wrap_tag() {
+        let bot_keys = Keys::generate();
+        let wrapper_keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::GiftWrap,
+            "encrypted-payload",
+            [Tag::parse(&["p", &bot_keys.public_key().to_hex()]).unwrap()],
+        )
+        .sign_with_keys(&wrapper_keys)
+        .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["control-channel".to_string()],
+            bot_keys,
+            owner_pubkey: Keys::generate().public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: None,
+        };
+
+        assert!(event_addresses_bot(&event, &config));
+    }
+
+    #[tokio::test]
+    async fn encrypted_owner_dm_command_round_trips() {
+        let bot_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let gift_wrap =
+            build_private_dm_gift_wrap(&owner_keys, bot_keys.public_key(), "get balance")
+                .await
+                .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["control-channel".to_string()],
+            bot_keys,
+            owner_pubkey: owner_keys.public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: None,
+        };
+
+        assert_eq!(gift_wrap.kind, Kind::GiftWrap);
+        assert!(event_addresses_bot(&gift_wrap, &config));
+        let plaintext = encrypted_owner_dm_plaintext(&config, &gift_wrap)
+            .await
+            .unwrap();
+        assert_eq!(plaintext, "get balance");
+        assert_eq!(parse_command(&plaintext), Ok(BotCommand::GetBalance));
+    }
+
+    #[tokio::test]
+    async fn encrypted_owner_dm_rejects_non_owner_sender() {
+        let bot_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let stranger_keys = Keys::generate();
+        let gift_wrap =
+            build_private_dm_gift_wrap(&stranger_keys, bot_keys.public_key(), "get balance")
+                .await
+                .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["control-channel".to_string()],
+            bot_keys,
+            owner_pubkey: owner_keys.public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: None,
+        };
+
+        assert!(encrypted_owner_dm_plaintext(&config, &gift_wrap)
+            .await
+            .is_err());
     }
 
     #[test]

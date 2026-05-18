@@ -43,13 +43,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.12-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.12/lexebot-v0.1.12-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.12-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.12/lexebot-v0.1.12-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.12-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.13-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.13/lexebot-v0.1.13-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.13-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.13/lexebot-v0.1.13-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.13-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.12-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.13-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
