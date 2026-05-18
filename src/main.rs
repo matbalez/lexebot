@@ -1131,23 +1131,12 @@ fn event_mentions_bot(event: &Event, config: &Config) -> bool {
 }
 
 fn event_addresses_bot(event: &Event, config: &Config) -> bool {
-    if event_mentions_bot(event, config) {
-        return true;
+    if event.kind == Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND) {
+        return event_mentions_bot(event, config);
     }
-    if event.kind != Kind::Custom(9) {
-        return false;
-    }
-    let Some(channel_id) = event_channel_id(event, config) else {
-        return false;
-    };
-    is_control_channel(config, channel_id) || text_addresses_bot(&event.content)
-}
-
-fn text_addresses_bot(content: &str) -> bool {
-    if !content.trim_start().starts_with('@') {
-        return false;
-    }
-    content.split_whitespace().any(is_bot_mention_token)
+    event.kind == Kind::Custom(9)
+        && event_channel_id(event, config)
+            .is_some_and(|channel_id| is_control_channel(config, channel_id))
 }
 
 fn event_channel_id<'a>(event: &'a Event, config: &Config) -> Option<&'a str> {
@@ -1689,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_command_only_triggers_in_control_channel() {
+    fn user_commands_only_trigger_in_control_channel() {
         let bot_keys = Keys::generate();
         let owner_keys = Keys::generate();
         let control_event = EventBuilder::new(
@@ -1706,6 +1695,16 @@ mod tests {
         )
         .sign_with_keys(&owner_keys)
         .unwrap();
+        let mentioned_other_event = EventBuilder::new(
+            Kind::Custom(9),
+            "@LexeBot get balance",
+            [
+                Tag::parse(&["h", "other-channel"]).unwrap(),
+                Tag::parse(&["p", &bot_keys.public_key().to_hex()]).unwrap(),
+            ],
+        )
+        .sign_with_keys(&owner_keys)
+        .unwrap();
         let config = Config {
             relay_url: DEFAULT_RELAY_URL.to_string(),
             channel_ids: vec!["control-channel".to_string(), "other-channel".to_string()],
@@ -1718,6 +1717,31 @@ mod tests {
 
         assert!(event_addresses_bot(&control_event, &config));
         assert!(!event_addresses_bot(&other_event, &config));
+        assert!(!event_addresses_bot(&mentioned_other_event, &config));
+    }
+
+    #[test]
+    fn encrypted_auto_kudos_still_uses_bot_mention_tag() {
+        let bot_keys = Keys::generate();
+        let kudos_keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND),
+            "encrypted-payload",
+            [Tag::parse(&["p", &bot_keys.public_key().to_hex()]).unwrap()],
+        )
+        .sign_with_keys(&kudos_keys)
+        .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["control-channel".to_string()],
+            bot_keys,
+            owner_pubkey: Keys::generate().public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: Some(kudos_keys.public_key()),
+        };
+
+        assert!(event_addresses_bot(&event, &config));
     }
 
     #[test]

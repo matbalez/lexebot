@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "lexebot"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "futures-util",
