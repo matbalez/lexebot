@@ -34,6 +34,8 @@ const OWNER_PROFILE_SUBSCRIPTION_ID: &str = "lexebot-owner-profile";
 const AUTO_KUDOS_COMMAND_KIND: u16 = 21_000;
 const AUTO_KUDOS_RESULT_KIND: u16 = 21_001;
 const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
+const PRESENCE_UPDATE_KIND: u16 = 20_001;
+const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DM_OPEN_KIND: u16 = 41_010;
 const BOT_NAME: &str = "lexebot";
 const BOT_DISPLAY_NAME: &str = "LexeBot";
@@ -249,10 +251,14 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let bot_display_name = resolve_bot_display_name(&mut ws, &runtime.config).await;
     let bolt12_offer = runtime.lexe.create_bolt12_offer().await?;
     publish_profile(&mut ws, &runtime.config, &bot_display_name, &bolt12_offer).await?;
+    publish_presence(&mut ws, &runtime.config, "online").await?;
     subscribe_to_channels(&mut ws, &runtime.config.channel_ids).await?;
     subscribe_to_auto_kudos_inbox(&mut ws, &runtime.config).await?;
 
     let started_at = nostr::Timestamp::now();
+    let mut presence_interval = tokio::time::interval(PRESENCE_REFRESH_INTERVAL);
+    presence_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    presence_interval.tick().await;
 
     eprintln!(
         "listening in {} channel(s) for @LexeBot commands: {}",
@@ -263,8 +269,12 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                let _ = publish_presence(&mut ws, &runtime.config, "offline").await;
                 eprintln!("shutting down");
                 return Ok(());
+            }
+            _ = presence_interval.tick() => {
+                publish_presence(&mut ws, &runtime.config, "online").await?;
             }
             next = ws.next() => {
                 let Some(message) = next else { bail!("relay closed the WebSocket"); };
@@ -434,6 +444,12 @@ fn build_profile(config: &Config, display_name: &str, bolt12_offer: &str) -> Eve
     )
 }
 
+async fn publish_presence(ws: &mut Ws, config: &Config, status: &str) -> Result<()> {
+    let event = EventBuilder::new(Kind::Custom(PRESENCE_UPDATE_KIND), status, [])
+        .sign_with_keys(&config.bot_keys)?;
+    send_json(ws, json!(["EVENT", event])).await
+}
+
 async fn resolve_bot_display_name(ws: &mut Ws, config: &Config) -> String {
     if let Some(owner_name) = &config.owner_display_name_override {
         return owner_lexebot_display_name(owner_name);
@@ -577,6 +593,7 @@ async fn handle_relay_text(
             let event = Event::from_json(event_value.to_string())?;
             maybe_reply(ws, runtime, started_at, &event).await?;
         }
+        Some("OK") => {}
         Some("EOSE") => {}
         Some("NOTICE") => eprintln!("relay: {value}"),
         Some("CLOSED") => handle_closed(&runtime.config, &value)?,
@@ -629,7 +646,7 @@ async fn maybe_reply(
     if event.pubkey == runtime.config.bot_keys.public_key() || event.created_at < started_at {
         return Ok(());
     }
-    if !event_mentions_bot(event, &runtime.config) {
+    if !event_addresses_bot(event, &runtime.config) {
         return Ok(());
     }
     if event.kind == Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND) {
@@ -1111,6 +1128,22 @@ fn event_mentions_bot(event: &Event, config: &Config) -> bool {
         parts.first().map(String::as_str) == Some("p")
             && parts.get(1).map(String::as_str) == Some(bot_pubkey.as_str())
     })
+}
+
+fn event_addresses_bot(event: &Event, config: &Config) -> bool {
+    if event_mentions_bot(event, config) {
+        return true;
+    }
+    event.kind == Kind::Custom(9)
+        && event_channel_id(event, config).is_some()
+        && text_addresses_bot(&event.content)
+}
+
+fn text_addresses_bot(content: &str) -> bool {
+    if !content.trim_start().starts_with('@') {
+        return false;
+    }
+    content.split_whitespace().any(is_bot_mention_token)
 }
 
 fn event_channel_id<'a>(event: &'a Event, config: &Config) -> Option<&'a str> {
@@ -1603,6 +1636,32 @@ mod tests {
         };
 
         assert!(!event_mentions_bot(&event, &config));
+        assert!(!event_addresses_bot(&event, &config));
+    }
+
+    #[test]
+    fn text_mention_in_configured_channel_triggers() {
+        let bot_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let event = EventBuilder::new(
+            Kind::Custom(9),
+            "@LexeBot get balance",
+            [Tag::parse(&["h", "control-channel"]).unwrap()],
+        )
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["control-channel".to_string()],
+            bot_keys,
+            owner_pubkey: owner_keys.public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: None,
+        };
+
+        assert!(!event_mentions_bot(&event, &config));
+        assert!(event_addresses_bot(&event, &config));
     }
 
     #[test]
