@@ -53,6 +53,11 @@ async fn main() -> Result<()> {
         print_configured_pubkey()?;
         return Ok(());
     }
+    if let Some(channel_id) = one_shot_arg("--send-install-welcome")? {
+        let config = Config::from_env()?;
+        send_install_welcome_once(&config, &channel_id).await?;
+        return Ok(());
+    }
 
     let config = Config::from_env()?;
     let lexe = LexeClient::from_env()?;
@@ -299,6 +304,19 @@ fn print_configured_pubkey() -> Result<()> {
         .context("SPROUT_BOT_PRIVATE_KEY must be an nsec or hex private key")?;
     println!("{}", keys.public_key().to_hex());
     Ok(())
+}
+
+fn one_shot_arg(flag: &str) -> Result<Option<String>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == flag {
+            return args
+                .next()
+                .map(Some)
+                .ok_or_else(|| anyhow!("{flag} requires a value"));
+        }
+    }
+    Ok(None)
 }
 
 struct Config {
@@ -771,6 +789,35 @@ async fn send_dm_message(
     send_json(ws, json!(["EVENT", event])).await?;
     wait_for_ok(ws, &event_id).await?;
     Ok(())
+}
+
+async fn send_install_welcome_once(config: &Config, channel_id: &str) -> Result<()> {
+    let mut ws = connect_and_authenticate(config).await?;
+    let event = build_message(
+        channel_id,
+        &install_welcome_message(),
+        &[config.owner_pubkey.to_hex()],
+    )?
+    .sign_with_keys(&config.bot_keys)?;
+    let event_id = event.id.to_hex();
+
+    send_json(&mut ws, json!(["EVENT", event])).await?;
+    wait_for_ok(&mut ws, &event_id).await?;
+    Ok(())
+}
+
+fn install_welcome_message() -> String {
+    format!(
+        "LexeBot v{} is installed and ready.\n\n\
+Supported commands:\n\
+@LexeBot get balance\n\
+@LexeBot get BOLT12\n\
+@LexeBot create invoice for ₿1,000\n\
+@LexeBot send ₿500 to <payment-target>\n\n\
+Auto-kudos runs in the background when Kudos is configured. \
+LexeBot does not need to be added to work channels for auto-kudos.",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 async fn open_dm_channel(ws: &mut Ws, config: &Config, recipient: PublicKey) -> Result<String> {

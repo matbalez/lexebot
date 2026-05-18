@@ -787,43 +787,26 @@ set_config_channels() {
   mv "$tmp" "$CONFIG_FILE"
 }
 
-install_welcome_message() {
-  cat <<EOF
-LexeBot ${LEXEBOT_VERSION} is installed and ready.
-
-Supported commands:
-@LexeBot get balance
-@LexeBot get BOLT12
-@LexeBot create invoice for ₿1,000
-@LexeBot send ₿500 to <payment-target>
-
-Auto-kudos runs in the background when Kudos is configured. LexeBot does not need to be added to work channels for auto-kudos.
-EOF
-}
-
 send_install_welcome_message() {
-  local sprout_cli="$1"
-  local bot_nsec="$2"
+  local bot_nsec="$1"
+  local owner_key="$2"
   local channel_id="$3"
-  local content
 
   [ -n "$bot_nsec" ] || {
     say "Skipping welcome message: missing LexeBot private key."
     return 0
   }
-
-  if ! "$sprout_cli" send-message --help >/dev/null 2>&1; then
-    say "Skipping welcome message: Sprout CLI does not support send-message."
+  [ -n "$owner_key" ] || {
+    say "Skipping welcome message: missing Sprout owner key."
     return 0
-  fi
+  }
 
-  content="$(install_welcome_message)"
   say "Sending LexeBot welcome message..."
-  if ! SPROUT_PRIVATE_KEY="$bot_nsec" "$sprout_cli" \
-    --relay "$RELAY_HTTP_URL" \
-    send-message \
-    --channel "$channel_id" \
-    --content "$content" >/dev/null
+  if ! SPROUT_RELAY_URL="$RELAY_WS_URL" \
+    SPROUT_BOT_PRIVATE_KEY="$bot_nsec" \
+    SPROUT_OWNER_PRIVATE_KEY="$owner_key" \
+    SPROUT_BOT_AUTH_MODE="owner-attested" \
+    "$LEXEBOT_BIN" --send-install-welcome "$channel_id" >/dev/null
   then
     say "Warning: install completed, but the welcome message could not be sent."
   fi
@@ -845,7 +828,7 @@ ensure_home_channel_for_existing_install() {
   sprout_cli="$(ensure_sprout_cli)"
   home_channel_id="$(sprout_open_home_dm "$sprout_cli" "$owner_key" "$bot_pubkey")"
   set_config_channels "$home_channel_id"
-  send_install_welcome_message "$sprout_cli" "$bot_nsec" "$home_channel_id"
+  send_install_welcome_message "$bot_nsec" "$owner_key" "$home_channel_id"
   say "${HOME_SURFACE_NAME} configured: ${home_channel_id}"
 }
 
@@ -885,7 +868,7 @@ main() {
   sprout_cli="$(ensure_sprout_cli)"
   home_channel_id="$(sprout_open_home_dm "$sprout_cli" "$owner_key" "$bot_pubkey")"
   set_config_channels "$home_channel_id"
-  send_install_welcome_message "$sprout_cli" "$bot_nsec" "$home_channel_id"
+  send_install_welcome_message "$bot_nsec" "$owner_key" "$home_channel_id"
 
   say
   say "Install complete."

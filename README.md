@@ -75,9 +75,9 @@ reads the Lexe SDK client credentials from `LEXE_CLIENT_CREDENTIALS`, stores the
 `~/.local/bin/run-lexebot`, installs the channel helper at
 `~/.local/bin/lexebot-add-channel`, installs the channel listing helper at
 `~/.local/bin/lexebot-list-channels`, opens a LexeBot DM, and configures that DM
-channel using the invoking user's Sprout identity. It then sends a one-time
-welcome message to the DM from the LexeBot identity with the installed version
-and supported commands. On a fresh install, it prints
+channel using the invoking user's Sprout identity. It then asks LexeBot to send
+a one-time welcome message to the DM using owner-attested auth, with the
+installed version and supported commands. On a fresh install, it prints
 the command to start LexeBot later, then runs LexeBot in the foreground in the
 current terminal so startup logs are visible. On rerun, it detects an existing
 local install and asks whether to start that existing bot instead of generating
