@@ -739,7 +739,7 @@ sprout_add_bot_to_channel() {
 sprout_create_home_channel() {
   local sprout_cli="$1"
   local owner_key="$2"
-  local output channel_id
+  local output event_id event_json channel_id
 
   say "Creating private ${HOME_CHANNEL_NAME} channel..."
   if "$sprout_cli" create-channel --help >/dev/null 2>&1; then
@@ -761,6 +761,19 @@ sprout_create_home_channel() {
   fi
 
   channel_id="$(printf '%s\n' "$output" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 | trim)"
+  if [ -n "$channel_id" ]; then
+    printf '%s\n' "$channel_id"
+    return 0
+  fi
+
+  event_id="$(printf '%s\n' "$output" | sed -n 's/.*"event_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 | trim)"
+  [ -n "$event_id" ] || fail "could not parse created ${HOME_CHANNEL_NAME} event id from Sprout CLI output: ${output}"
+
+  event_json="$(SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
+    --relay "$RELAY_HTTP_URL" \
+    get-event \
+    --event "$event_id")"
+  channel_id="$(printf '%s\n' "$event_json" | sed -n 's/.*\[[[:space:]]*"h"[[:space:]]*,[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 | trim)"
   [ -n "$channel_id" ] || fail "could not parse created ${HOME_CHANNEL_NAME} channel id from Sprout CLI output: ${output}"
   printf '%s\n' "$channel_id"
 }
