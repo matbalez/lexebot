@@ -18,6 +18,7 @@ use nostr::bitcoin::hashes::sha256::Hash as Sha256Hash;
 use nostr::bitcoin::hashes::Hash;
 use nostr::bitcoin::secp256k1::schnorr::Signature;
 use nostr::bitcoin::secp256k1::{Message as SecpMessage, XOnlyPublicKey};
+use nostr::nips::nip44::{self, Version as Nip44Version};
 use nostr::{
     Alphabet, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, SingleLetterTag, Tag,
     ToBech32, Url, SECP256K1,
@@ -28,9 +29,11 @@ use url::Url as WsUrl;
 
 const DEFAULT_RELAY_URL: &str = "ws://localhost:3000";
 const SUBSCRIPTION_ID: &str = "lexebot";
+const AUTO_KUDOS_SUBSCRIPTION_ID: &str = "lexebot-auto-kudos";
 const OWNER_PROFILE_SUBSCRIPTION_ID: &str = "lexebot-owner-profile";
 const AUTO_KUDOS_COMMAND_KIND: u16 = 21_000;
 const AUTO_KUDOS_RESULT_KIND: u16 = 21_001;
+const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
 const DM_OPEN_KIND: u16 = 41_010;
 const BOT_NAME: &str = "lexebot";
 const BOT_DISPLAY_NAME: &str = "LexeBot";
@@ -242,6 +245,7 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let bolt12_offer = runtime.lexe.create_bolt12_offer().await?;
     publish_profile(&mut ws, &runtime.config, &bot_display_name, &bolt12_offer).await?;
     subscribe_to_channels(&mut ws, &runtime.config.channel_ids).await?;
+    subscribe_to_auto_kudos_inbox(&mut ws, &runtime.config).await?;
 
     let started_at = nostr::Timestamp::now();
 
@@ -396,10 +400,15 @@ fn build_profile(config: &Config, display_name: &str, bolt12_offer: &str) -> Eve
             "picture": BOT_ICON_DATA_URL,
             "about": BOT_ABOUT,
             "lexebot": {
-                "version": 1,
+                "version": 2,
                 "owner_pubkey": config.owner_pubkey.to_hex(),
                 "owner_auth": config.owner_auth_tag.as_ref().map(auth_tag_json),
                 "bolt12_offer": bolt12_offer,
+                "auto_kudos": {
+                    "encrypted": "nip44",
+                    "command_kind": AUTO_KUDOS_COMMAND_KIND,
+                    "result_kind": AUTO_KUDOS_RESULT_KIND,
+                },
             },
         })
         .to_string(),
@@ -513,6 +522,14 @@ async fn subscribe_to_channels(ws: &mut Ws, channel_ids: &[String]) -> Result<()
     Ok(())
 }
 
+async fn subscribe_to_auto_kudos_inbox(ws: &mut Ws, config: &Config) -> Result<()> {
+    let bot_pubkey = config.bot_keys.public_key().to_hex();
+    let filter = Filter::new()
+        .kind(Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND))
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), [bot_pubkey]);
+    send_json(ws, json!(["REQ", AUTO_KUDOS_SUBSCRIPTION_ID, filter])).await
+}
+
 async fn subscribe_to_channel(ws: &mut Ws, channel_id: &str) -> Result<()> {
     let filter = Filter::new()
         .kinds([Kind::Custom(9), Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND)])
@@ -597,6 +614,10 @@ async fn maybe_reply(
     if !event_mentions_bot(event, &runtime.config) {
         return Ok(());
     }
+    if event.kind == Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND) {
+        handle_encrypted_auto_kudos(ws, runtime, event).await?;
+        return Ok(());
+    }
     let Some(channel_id) = event_channel_id(event, &runtime.config) else {
         return Ok(());
     };
@@ -615,18 +636,15 @@ async fn maybe_reply(
                 .await
                 {
                     Ok(Ok(_)) => {
-                        send_auto_kudos_result(ws, &runtime.config, channel_id, event, true)
-                            .await?;
+                        send_auto_kudos_result(ws, &runtime.config, event, true).await?;
                         eprintln!("processed silent auto-kudos command {command_event_id}");
                     }
                     Ok(Err(err)) => {
-                        send_auto_kudos_result(ws, &runtime.config, channel_id, event, false)
-                            .await?;
+                        send_auto_kudos_result(ws, &runtime.config, event, false).await?;
                         eprintln!("silent auto-kudos command {command_event_id} failed: {err:#}");
                     }
                     Err(_) => {
-                        send_auto_kudos_result(ws, &runtime.config, channel_id, event, false)
-                            .await?;
+                        send_auto_kudos_result(ws, &runtime.config, event, false).await?;
                         eprintln!(
                             "silent auto-kudos command {command_event_id} timed out after {} seconds",
                             AUTO_KUDOS_PAYMENT_TIMEOUT.as_secs()
@@ -675,22 +693,66 @@ async fn maybe_reply(
     Ok(())
 }
 
+async fn handle_encrypted_auto_kudos(ws: &mut Ws, runtime: &Runtime, event: &Event) -> Result<()> {
+    let command_event_id = event.id.to_hex();
+    let command = match encrypted_auto_kudos_command(&runtime.config, event) {
+        Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => command,
+        Ok(_) => {
+            send_auto_kudos_result(ws, &runtime.config, event, false).await?;
+            eprintln!("rejected unauthorized encrypted auto-kudos command {command_event_id}");
+            return Ok(());
+        }
+        Err(err) => {
+            send_auto_kudos_result(ws, &runtime.config, event, false).await?;
+            eprintln!("invalid encrypted auto-kudos command {command_event_id}: {err:#}");
+            return Ok(());
+        }
+    };
+
+    match tokio::time::timeout(AUTO_KUDOS_PAYMENT_TIMEOUT, runtime.lexe.execute(command)).await {
+        Ok(Ok(_)) => {
+            send_auto_kudos_result(ws, &runtime.config, event, true).await?;
+            eprintln!("processed encrypted auto-kudos command {command_event_id}");
+        }
+        Ok(Err(err)) => {
+            send_auto_kudos_result(ws, &runtime.config, event, false).await?;
+            eprintln!("encrypted auto-kudos command {command_event_id} failed: {err:#}");
+        }
+        Err(_) => {
+            send_auto_kudos_result(ws, &runtime.config, event, false).await?;
+            eprintln!(
+                "encrypted auto-kudos command {command_event_id} timed out after {} seconds",
+                AUTO_KUDOS_PAYMENT_TIMEOUT.as_secs()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 async fn send_auto_kudos_result(
     ws: &mut Ws,
     config: &Config,
-    channel_id: &str,
     request: &Event,
     sent: bool,
 ) -> Result<()> {
-    let content = if sent { "sent" } else { "failed" };
+    let content = json!({
+        "version": AUTO_KUDOS_PROTOCOL_VERSION,
+        "type": "auto-kudos-result",
+        "request_event_id": request.id.to_hex(),
+        "status": if sent { "sent" } else { "failed" },
+    })
+    .to_string();
+    let encrypted = nip44::encrypt(
+        config.bot_keys.secret_key(),
+        &request.pubkey,
+        content,
+        Nip44Version::default(),
+    )?;
     let event = EventBuilder::new(
         Kind::Ephemeral(AUTO_KUDOS_RESULT_KIND),
-        content,
-        [
-            Tag::parse(&["h", channel_id])?,
-            Tag::parse(&["e", &request.id.to_hex()])?,
-            Tag::parse(&["p", &request.pubkey.to_hex()])?,
-        ],
+        encrypted,
+        [Tag::parse(&["p", &request.pubkey.to_hex()])?],
     )
     .sign_with_keys(&config.bot_keys)?;
     send_json(ws, json!(["EVENT", event])).await
@@ -757,6 +819,54 @@ fn command_authorized(command: &BotCommand, sender: PublicKey, config: &Config) 
     };
 
     config.kudos_bot_pubkey == Some(sender) && *kudos_sender == config.owner_pubkey
+}
+
+fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCommand> {
+    let decrypted = nip44::decrypt(
+        config.bot_keys.secret_key(),
+        &event.pubkey,
+        event.content.as_str(),
+    )?;
+    let value: Value = serde_json::from_str(&decrypted)?;
+
+    if value.get("version").and_then(Value::as_u64) != Some(AUTO_KUDOS_PROTOCOL_VERSION) {
+        bail!("unsupported auto-kudos command version");
+    }
+    if value.get("type").and_then(Value::as_str) != Some("auto-kudos") {
+        bail!("unexpected auto-kudos command type");
+    }
+
+    let sender = value
+        .get("sender_pubkey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("auto-kudos command missing sender_pubkey"))
+        .and_then(|pubkey| {
+            PublicKey::from_hex(pubkey).context("auto-kudos sender_pubkey is invalid")
+        })?;
+    let receiver = value
+        .get("receiver_pubkey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("auto-kudos command missing receiver_pubkey"))
+        .and_then(|pubkey| {
+            PublicKey::from_hex(pubkey).context("auto-kudos receiver_pubkey is invalid")
+        })?;
+    let amount = value
+        .get("amount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("auto-kudos command missing amount"))?;
+    let payable = value
+        .get("payable")
+        .and_then(Value::as_str)
+        .filter(|payable| !payable.trim().is_empty())
+        .ok_or_else(|| anyhow!("auto-kudos command missing payable"))?
+        .to_string();
+
+    Ok(BotCommand::AutoKudosSend {
+        sender,
+        receiver,
+        amount,
+        payable,
+    })
 }
 
 fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result<EventBuilder> {
@@ -1254,9 +1364,20 @@ fn channel_ids_from_env() -> Result<Vec<String>> {
     let value = std::env::var("SPROUT_CHANNEL_IDS")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("SPROUT_CHANNEL_ID").ok())
-        .context("SPROUT_CHANNEL_IDS or SPROUT_CHANNEL_ID is required")?;
+        .or_else(|| {
+            std::env::var("SPROUT_CHANNEL_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+    Ok(channel_ids_from_value(value.as_deref()))
+}
+
+fn channel_ids_from_value(value: Option<&str>) -> Vec<String> {
     let mut channel_ids = Vec::new();
+
+    let Some(value) = value else {
+        return channel_ids;
+    };
 
     for raw in value.split([',', '\n', ' ', '\t']) {
         let channel_id = raw.trim();
@@ -1266,11 +1387,7 @@ fn channel_ids_from_env() -> Result<Vec<String>> {
         channel_ids.push(channel_id.to_string());
     }
 
-    if channel_ids.is_empty() {
-        bail!("SPROUT_CHANNEL_IDS must contain at least one channel UUID");
-    }
-
-    Ok(channel_ids)
+    channel_ids
 }
 
 fn optional_u64_env(name: &str) -> Result<Option<u64>> {
@@ -1465,6 +1582,15 @@ mod tests {
     }
 
     #[test]
+    fn no_channels_can_be_configured_for_auto_kudos_only_mode() {
+        assert_eq!(channel_ids_from_value(None), Vec::<String>::new());
+        assert_eq!(
+            channel_ids_from_value(Some("  \n\t ")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn auto_kudos_requires_configured_kudos_bot_and_owner_sender() {
         let owner_keys = Keys::generate();
         let bot_keys = Keys::generate();
@@ -1495,6 +1621,59 @@ mod tests {
             Keys::generate().public_key(),
             &config
         ));
+    }
+
+    #[test]
+    fn encrypted_auto_kudos_command_round_trips() {
+        let bot_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let kudos_keys = Keys::generate();
+        let receiver = Keys::generate().public_key();
+        let payload = json!({
+            "version": AUTO_KUDOS_PROTOCOL_VERSION,
+            "type": "auto-kudos",
+            "sender_pubkey": owner_keys.public_key().to_hex(),
+            "receiver_pubkey": receiver.to_hex(),
+            "amount": 21,
+            "payable": "lno1abc",
+            "source_event_id": "c87370826bf84cbf48bd8e5c50d485a5df251a8b76595cc60916783ab4f5a422",
+        })
+        .to_string();
+        let encrypted = nip44::encrypt(
+            kudos_keys.secret_key(),
+            &bot_keys.public_key(),
+            payload,
+            Nip44Version::default(),
+        )
+        .unwrap();
+        let event = EventBuilder::new(
+            Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND),
+            encrypted,
+            [Tag::parse(&["p", &bot_keys.public_key().to_hex()]).unwrap()],
+        )
+        .sign_with_keys(&kudos_keys)
+        .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["test-channel".to_string()],
+            bot_keys,
+            owner_pubkey: owner_keys.public_key(),
+            owner_display_name_override: None,
+            owner_auth_tag: None,
+            kudos_bot_pubkey: Some(kudos_keys.public_key()),
+        };
+
+        let command = encrypted_auto_kudos_command(&config, &event).unwrap();
+        assert_eq!(
+            command,
+            BotCommand::AutoKudosSend {
+                sender: owner_keys.public_key(),
+                receiver,
+                amount: 21,
+                payable: "lno1abc".to_string(),
+            }
+        );
+        assert!(command_authorized(&command, event.pubkey, &config));
     }
 
     #[test]

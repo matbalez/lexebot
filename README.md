@@ -1,7 +1,8 @@
 # LexeBot
 
-A deterministic Sprout bot that runs locally and lets one configured owner
-control a Lexe wallet from configured Sprout channels.
+A deterministic Sprout bot that runs locally, receives encrypted auto-kudos
+commands, and optionally lets one configured owner control a Lexe wallet from a
+private Sprout channel.
 
 LexeBot is not AI-powered. It holds a Nostr bot key for Sprout messages and a
 Lexe SDK client credential string supplied locally by the user. It only accepts
@@ -42,13 +43,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.7-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.7/lexebot-v0.1.7-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.7-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.7/lexebot-v0.1.7-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.7-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.8-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.8/lexebot-v0.1.8-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.8-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.8/lexebot-v0.1.8-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.8-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.7-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.8-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
@@ -58,7 +59,8 @@ Make sure `~/.local/bin` is on your `PATH`.
 ### Sprout Install Script
 
 For Sprout users on Apple Silicon Macs, the repo includes an installer that
-sets up LexeBot locally and adds Flint Alpha as the default channel:
+sets up LexeBot locally, creates a private `lexebot` home channel for manual
+wallet commands, and starts LexeBot:
 
 ```bash
 LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' \
@@ -72,8 +74,9 @@ reads the Lexe SDK client credentials from `LEXE_CLIENT_CREDENTIALS`, stores the
 `~/.config/lexebot/lexebot.env` with file mode `600`, installs the runner at
 `~/.local/bin/run-lexebot`, installs the channel helper at
 `~/.local/bin/lexebot-add-channel`, installs the channel listing helper at
-`~/.local/bin/lexebot-list-channels`, and adds the bot to Flint Alpha as role
-`bot` using the invoking user's admin identity. On a fresh install, it prints
+`~/.local/bin/lexebot-list-channels`, creates a private `lexebot` home channel,
+and adds the bot to that channel as role `bot` using the invoking user's Sprout
+identity. On a fresh install, it prints
 the command to start LexeBot later, then runs LexeBot in the foreground in the
 current terminal so startup logs are visible. On rerun, it detects an existing
 local install and asks whether to start that existing bot instead of generating
@@ -82,21 +85,25 @@ Sprout profile on startup and publishes the bot profile as
 `LexeBot[<owner display name without spaces>]`.
 If the installer is newer than the local installed version, rerunning the
 installer upgrades the binary and runner while preserving the existing local
-config and bot identity.
+config and bot identity. During that upgrade, the legacy Flint Alpha channel
+subscription is removed from `SPROUT_CHANNEL_IDS`; auto-kudos does not need
+LexeBot to subscribe to work channels. If the resulting config has no channel
+subscriptions, the normal installer path creates a private `lexebot` home
+channel and configures LexeBot to listen there for manual wallet commands.
 
-If you do not want the installer to use or build Sprout CLI to add the bot to
-the channel, use manual-add mode:
+If you do not want the installer to use or build Sprout CLI to create the
+private home channel, use manual-add mode:
 
 ```bash
 LEXE_CLIENT_CREDENTIALS='paste-client-credential-here' \
   bash <(curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh) --manual-add
 ```
 
-Manual-add mode installs LexeBot, writes local config, prints the LexeBot pubkey
-for a channel admin to add as role `bot`, and exits without starting LexeBot.
-Start LexeBot only after the channel admin confirms the bot pubkey was added;
-otherwise the relay will reject channel subscriptions because the bot is not a
-member yet.
+Manual-add mode installs LexeBot, writes local config with no channel
+subscriptions, prints the LexeBot pubkey, and exits without starting LexeBot.
+Auto-kudos can run channel-free. For manual wallet commands, create a private
+`lexebot` channel in Sprout, add the printed LexeBot pubkey as role `bot`, then
+configure that channel with `lexebot-add-channel <channel-uuid>`.
 
 After the first install, start LexeBot from any directory with:
 
@@ -118,7 +125,8 @@ lexebot-add-channel <channel-uuid>
 
 Then restart LexeBot with `run-lexebot`. The helper adds the bot pubkey to the
 channel as role `bot` and appends the channel UUID to
-`~/.config/lexebot/lexebot.env`.
+`~/.config/lexebot/lexebot.env`. Prefer using this for a private `lexebot`
+home/control channel, not for every work channel where Kudos may be used.
 
 Until Sprout exposes a copy button for channel UUIDs in the UI, use the
 installed helper to list channels and copy the target `id`/UUID:
@@ -145,13 +153,17 @@ Run LexeBot:
 
 ```bash
 SPROUT_RELAY_URL=wss://sprout.up.railway.app \
-SPROUT_CHANNEL_IDS=<channel-uuid>[,<channel-uuid>...] \
+SPROUT_CHANNEL_IDS=<optional-home-channel-uuid>[,<channel-uuid>...] \
 SPROUT_BOT_PRIVATE_KEY=<bot-nsec-or-hex-secret> \
 SPROUT_OWNER_PRIVATE_KEY=<your-sprout-owner-or-agent-secret> \
 SPROUT_BOT_AUTH_MODE=owner-attested \
 LEXE_CLIENT_CREDENTIALS=<lexe-client-credentials> \
 cargo +1.90.0 run --manifest-path /Users/mattyb/.sprout/REPOS/lexebot/Cargo.toml
 ```
+
+`SPROUT_CHANNEL_IDS` is optional. Leave it unset or empty for auto-kudos-only
+mode; configure a private home/control channel only if the owner should send
+manual wallet commands to LexeBot.
 
 With `SPROUT_BOT_AUTH_MODE=owner-attested`, LexeBot derives the owner pubkey
 from `SPROUT_OWNER_PRIVATE_KEY`. `LEXEBOT_OWNER_PUBKEY` is optional in this
@@ -191,26 +203,32 @@ Other bots can verify `owner_auth` against the LexeBot pubkey before treating
 the profile as an owner-to-LexeBot mapping. `bolt12_offer` is a reusable
 no-minimum BOLT12 offer generated on startup.
 
-If `LEXEBOT_KUDOS_BOT_PUBKEY` is set, LexeBot accepts a narrow machine command
-from that Kudos bot on ephemeral event kind `21000`:
+If `LEXEBOT_KUDOS_BOT_PUBKEY` is set, LexeBot accepts a narrow encrypted
+machine command from that Kudos bot on global ephemeral event kind `21000`. The
+event is p-tagged to this LexeBot and its JSON command body is encrypted to the
+LexeBot pubkey with NIP-44. The command only executes when its encrypted
+`sender_pubkey` is this LexeBot's configured owner.
 
-```text
-@LexeBot auto-kudos <sender-pubkey> <receiver-pubkey> ₿500 to <payment-target>
-```
+Successful auto-kudos payments are silent in chat, then LexeBot sends an
+encrypted global ephemeral kind `21001` result back to Kudos so Kudos can post a
+terse public confirmation. The result event is only p-tagged to Kudos; request
+correlation stays inside the encrypted payload. Failures are logged to the
+LexeBot terminal. Normal wallet commands still require the owner pubkey and
+still happen in a configured channel/DM.
 
-The command only executes when `<sender-pubkey>` is this LexeBot's configured
-owner. Successful auto-kudos payments are silent in chat, then LexeBot sends an
-ephemeral kind `21001` result back to Kudos so Kudos can post a terse public
-confirmation. Failures are logged to the LexeBot terminal. Normal wallet
-commands still require the owner pubkey.
+Because auto-kudos commands are direct encrypted machine events, LexeBot does
+not need to be a member of every public/private channel where Kudos is present.
+It only needs to be running locally and publishing its verified profile/BOLT12
+offer.
 
 The Flint Alpha installer sets `LEXEBOT_KUDOS_BOT_PUBKEY` to the Flint Alpha
 Kudos bot pubkey by default, and backfills that value for existing installs.
 
-If startup logs say LexeBot is authenticated but is not a channel member, add
-the printed bot pubkey to the channel as a bot using a Sprout identity allowed
-to add members. In Flint Alpha, Steve and DK can run this themselves if they
-have admin privileges.
+If startup logs say LexeBot is authenticated but is not a channel member, either
+remove that channel id from `~/.config/lexebot/lexebot.env` or add the printed
+bot pubkey to that channel as a bot using a Sprout identity allowed to add
+members. For the local-only auto-kudos model, work channels should normally not
+be listed there.
 
 ```bash
 SPROUT_PRIVATE_KEY=<your-existing-sprout-nsec-or-hex-secret> \

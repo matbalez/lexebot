@@ -26,7 +26,6 @@ if [ -z "${SPROUT_CHANNEL_ID:-}" ] && [ -n "${SPROUT_CHANNEL_IDS:-}" ]; then
 fi
 
 : "${SPROUT_RELAY_URL:?missing SPROUT_RELAY_URL in config}"
-: "${SPROUT_CHANNEL_IDS:?missing SPROUT_CHANNEL_IDS in config}"
 : "${SPROUT_OWNER_PRIVATE_KEY:?missing SPROUT_OWNER_PRIVATE_KEY in config}"
 : "${SPROUT_BOT_PRIVATE_KEY:?missing SPROUT_BOT_PRIVATE_KEY in config}"
 : "${SPROUT_BOT_AUTH_MODE:?missing SPROUT_BOT_AUTH_MODE in config}"

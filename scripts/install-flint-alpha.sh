@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_CHANNEL_ID="1df37399-3c25-4019-8bc7-faacd53587d0"
-DEFAULT_CHANNEL_NAME="Flint Alpha"
+LEGACY_DEFAULT_CHANNEL_ID="1df37399-3c25-4019-8bc7-faacd53587d0"
+HOME_CHANNEL_NAME="lexebot"
 DEFAULT_KUDOS_BOT_PUBKEY="84c220e52abb478dad3b96796383bea7dd989fb1540ea26b3478f706f78b7f8c"
 RELAY_WS_URL="wss://sprout.up.railway.app"
 RELAY_HTTP_URL="https://sprout.up.railway.app"
-LEXEBOT_VERSION="v0.1.7"
+LEXEBOT_VERSION="v0.1.8"
 LEXEBOT_ARCHIVE="lexebot-${LEXEBOT_VERSION}-aarch64-apple-darwin.tar.gz"
 LEXEBOT_RELEASE_BASE="https://github.com/matbalez/lexebot/releases/download/${LEXEBOT_VERSION}"
 RUNNER_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/run.sh"
@@ -56,9 +56,8 @@ Usage:
   install.sh [--manual-add]
 
 Options:
-  --manual-add   Do not use or build Sprout CLI to add LexeBot to the channel.
-                 Print the LexeBot pubkey for a channel admin to add manually,
-                 then exit without starting LexeBot.
+  --manual-add   Create/install the LexeBot identity and print its pubkey.
+                 Do not create a private home channel and do not start LexeBot.
 EOF
 }
 
@@ -114,18 +113,17 @@ print_manual_add_instructions() {
   local bot_pubkey="$1"
 
   say
-  say "Manual channel add requested."
-  say "Ask a Flint Alpha channel admin to add this LexeBot pubkey as role bot:"
+  say "Manual setup requested."
+  say "LexeBot pubkey:"
   say
   say "  ${bot_pubkey}"
   say
-  say "Admin command, if they have Sprout CLI:"
-  say "  sprout channels add-member \\"
-  say "    --channel ${DEFAULT_CHANNEL_ID} \\"
-  say "    --pubkey ${bot_pubkey} \\"
-  say "    --role bot"
+  say "Auto-kudos does not require adding LexeBot to work channels."
+  say "For manual wallet commands, create a private '${HOME_CHANNEL_NAME}' channel in Sprout,"
+  say "add the LexeBot pubkey above as role bot, then configure that channel with:"
+  say "  $(add_channel_command)"
   say
-  say "After the admin confirms the bot was added, start LexeBot with:"
+  say "After that, start LexeBot with:"
   say "  $(start_command)"
 }
 
@@ -135,6 +133,28 @@ configured_bot_pubkey() {
     # shellcheck disable=SC1090
     . "$CONFIG_FILE" 2>/dev/null
     printf '%s\n' "${SPROUT_BOT_PUBKEY:-}"
+  ) | trim
+}
+
+configured_channel_ids() {
+  [ -f "$CONFIG_FILE" ] || return 1
+  (
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    if [ -n "${SPROUT_CHANNEL_IDS:-}" ]; then
+      printf '%s\n' "$SPROUT_CHANNEL_IDS"
+    else
+      printf '%s\n' "${SPROUT_CHANNEL_ID:-}"
+    fi
+  ) | trim
+}
+
+configured_owner_key() {
+  [ -f "$CONFIG_FILE" ] || return 1
+  (
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE" 2>/dev/null
+    printf '%s\n' "${SPROUT_OWNER_PRIVATE_KEY:-}"
   ) | trim
 }
 
@@ -191,7 +211,7 @@ migrate_legacy_config() {
 
 normalize_config_channels() {
   [ -f "$CONFIG_FILE" ] || return 0
-  local existing_channel_ids existing_channel_id quoted_channels tmp
+  local existing_channel_ids existing_channel_id normalized channel_id quoted_channels tmp
 
   existing_channel_ids="$(
     # shellcheck disable=SC1090
@@ -207,11 +227,17 @@ normalize_config_channels() {
   if [ -z "$existing_channel_ids" ] && [ -n "$existing_channel_id" ]; then
     existing_channel_ids="$existing_channel_id"
   fi
-  if [ -z "$existing_channel_ids" ]; then
-    existing_channel_ids="$DEFAULT_CHANNEL_ID"
-  fi
 
-  quoted_channels="$(shell_quote "$existing_channel_ids")"
+  normalized=""
+  for channel_id in $existing_channel_ids; do
+    [ "$channel_id" != "$LEGACY_DEFAULT_CHANNEL_ID" ] || continue
+    case " $normalized " in
+      *" $channel_id "*) ;;
+      *) normalized="$(printf '%s %s' "$normalized" "$channel_id" | trim)" ;;
+    esac
+  done
+
+  quoted_channels="$(shell_quote "$normalized")"
   tmp="${CONFIG_FILE}.tmp.$$"
   awk -v quoted_channels="$quoted_channels" '
     BEGIN { updated = 0 }
@@ -236,6 +262,10 @@ normalize_config_channels() {
   ' "$CONFIG_FILE" >"$tmp"
   chmod 600 "$tmp"
   mv "$tmp" "$CONFIG_FILE"
+
+  if [ "$existing_channel_ids" != "$normalized" ]; then
+    say "Updated ${CONFIG_FILE} channel subscriptions for the local-only auto-kudos model."
+  fi
 }
 
 ensure_config_bot_pubkey() {
@@ -423,6 +453,7 @@ handle_existing_install() {
       print_manual_add_instructions "$bot_pubkey"
       exit 0
     fi
+    ensure_home_channel_for_existing_install
     start_lexebot
     exit 0
   fi
@@ -435,6 +466,8 @@ handle_existing_install() {
     print_manual_add_instructions "$bot_pubkey"
     exit 0
   fi
+
+  ensure_home_channel_for_existing_install
 
   if [ -n "$(lexebot_pid)" ]; then
     start_lexebot
@@ -657,7 +690,7 @@ write_config() {
   {
     printf 'SPROUT_RELAY_URL=%s\n' "$(shell_quote "$RELAY_WS_URL")"
     printf 'SPROUT_HTTP_RELAY_URL=%s\n' "$(shell_quote "$RELAY_HTTP_URL")"
-    printf 'SPROUT_CHANNEL_IDS=%s\n' "$(shell_quote "$DEFAULT_CHANNEL_ID")"
+    printf 'SPROUT_CHANNEL_IDS=%s\n' "$(shell_quote "")"
     printf 'SPROUT_OWNER_PRIVATE_KEY=%s\n' "$(shell_quote "$owner_key")"
     printf 'SPROUT_BOT_PUBKEY=%s\n' "$(shell_quote "$bot_pubkey")"
     printf 'SPROUT_BOT_PRIVATE_KEY=%s\n' "$(shell_quote "$bot_nsec")"
@@ -675,16 +708,17 @@ sprout_add_bot_to_channel() {
   local sprout_cli="$1"
   local owner_key="$2"
   local bot_pubkey="$3"
+  local channel_id="$4"
 
-  say "Adding LexeBot to ${DEFAULT_CHANNEL_NAME} as role bot..."
+  say "Adding LexeBot to ${HOME_CHANNEL_NAME} as role bot..."
   if "$sprout_cli" channels add-member --help >/dev/null 2>&1; then
     SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
       --relay "$RELAY_HTTP_URL" \
       channels add-member \
-      --channel "$DEFAULT_CHANNEL_ID" \
+      --channel "$channel_id" \
       --pubkey "$bot_pubkey" \
       --role bot
-    say "LexeBot was added to ${DEFAULT_CHANNEL_NAME}."
+    say "LexeBot was added to ${HOME_CHANNEL_NAME}."
     return 0
   fi
 
@@ -692,14 +726,92 @@ sprout_add_bot_to_channel() {
     SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
       --relay "$RELAY_HTTP_URL" \
       add-channel-member \
-      --channel "$DEFAULT_CHANNEL_ID" \
+      --channel "$channel_id" \
       --pubkey "$bot_pubkey" \
       --role bot
-    say "LexeBot was added to ${DEFAULT_CHANNEL_NAME}."
+    say "LexeBot was added to ${HOME_CHANNEL_NAME}."
     return 0
   fi
 
   fail "Sprout CLI at ${sprout_cli} does not support adding channel members"
+}
+
+sprout_create_home_channel() {
+  local sprout_cli="$1"
+  local owner_key="$2"
+  local output channel_id
+
+  say "Creating private ${HOME_CHANNEL_NAME} channel..."
+  if "$sprout_cli" create-channel --help >/dev/null 2>&1; then
+    output="$(SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
+      --relay "$RELAY_HTTP_URL" \
+      create-channel \
+      --name "$HOME_CHANNEL_NAME" \
+      --type stream \
+      --visibility private)"
+  elif "$sprout_cli" channels create --help >/dev/null 2>&1; then
+    output="$(SPROUT_PRIVATE_KEY="$owner_key" "$sprout_cli" \
+      --relay "$RELAY_HTTP_URL" \
+      channels create \
+      --name "$HOME_CHANNEL_NAME" \
+      --type stream \
+      --visibility private)"
+  else
+    fail "Sprout CLI at ${sprout_cli} does not support creating channels"
+  fi
+
+  channel_id="$(printf '%s\n' "$output" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 | trim)"
+  [ -n "$channel_id" ] || fail "could not parse created ${HOME_CHANNEL_NAME} channel id from Sprout CLI output: ${output}"
+  printf '%s\n' "$channel_id"
+}
+
+set_config_channels() {
+  local channel_ids="$1"
+  local quoted_channels tmp
+
+  quoted_channels="$(shell_quote "$channel_ids")"
+  tmp="${CONFIG_FILE}.tmp.$$"
+  awk -v quoted_channels="$quoted_channels" '
+    BEGIN { updated = 0 }
+    /^SPROUT_CHANNEL_IDS=/ {
+      print "SPROUT_CHANNEL_IDS=" quoted_channels
+      updated = 1
+      next
+    }
+    /^SPROUT_CHANNEL_ID=/ {
+      if (!updated) {
+        print "SPROUT_CHANNEL_IDS=" quoted_channels
+        updated = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print "SPROUT_CHANNEL_IDS=" quoted_channels
+      }
+    }
+  ' "$CONFIG_FILE" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+ensure_home_channel_for_existing_install() {
+  local existing_channels bot_pubkey owner_key sprout_cli home_channel_id
+
+  existing_channels="$(configured_channel_ids || true)"
+  [ -z "$existing_channels" ] || return 0
+
+  bot_pubkey="$(configured_bot_pubkey)"
+  [ -n "$bot_pubkey" ] || fail "could not determine LexeBot pubkey from ${CONFIG_FILE}"
+  owner_key="$(configured_owner_key)"
+  [ -n "$owner_key" ] || fail "could not determine Sprout owner key from ${CONFIG_FILE}"
+
+  sprout_cli="$(ensure_sprout_cli)"
+  home_channel_id="$(sprout_create_home_channel "$sprout_cli" "$owner_key")"
+  set_config_channels "$home_channel_id"
+  sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey" "$home_channel_id"
+  say "Private ${HOME_CHANNEL_NAME} channel configured: ${home_channel_id}"
 }
 
 main() {
@@ -715,7 +827,7 @@ main() {
   install_runner
 
   local owner_key_file owner_key bot_pubkey bot_nsec lexe_credentials generated
-  local sprout_cli
+  local sprout_cli home_channel_id
   owner_key_file="$(find_owner_key_file)" || fail "Sprout identity key not found. Launch Sprout once, then rerun this installer."
   owner_key="$(read_secret_file "$owner_key_file")" || fail "could not read ${owner_key_file}"
   [ -n "$owner_key" ] || fail "Sprout identity key is empty"
@@ -730,17 +842,19 @@ main() {
   if [ "$MANUAL_ADD" -eq 1 ]; then
     say
     say "Install complete."
-    say "Default channel configured: ${DEFAULT_CHANNEL_NAME} (${DEFAULT_CHANNEL_ID})"
+    say "No channel subscriptions configured."
     print_manual_add_instructions "$bot_pubkey"
     exit 0
   fi
 
   sprout_cli="$(ensure_sprout_cli)"
-  sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey"
+  home_channel_id="$(sprout_create_home_channel "$sprout_cli" "$owner_key")"
+  set_config_channels "$home_channel_id"
+  sprout_add_bot_to_channel "$sprout_cli" "$owner_key" "$bot_pubkey" "$home_channel_id"
 
   say
   say "Install complete."
-  say "Default channel configured: ${DEFAULT_CHANNEL_NAME} (${DEFAULT_CHANNEL_ID})"
+  say "Private ${HOME_CHANNEL_NAME} channel configured: ${home_channel_id}"
   say "List available channels with:"
   say "$(list_channels_command)"
   say "Add another channel later with:"
