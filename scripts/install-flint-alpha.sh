@@ -6,7 +6,7 @@ HOME_SURFACE_NAME="LexeBot DM"
 DEFAULT_KUDOS_BOT_PUBKEY="84c220e52abb478dad3b96796383bea7dd989fb1540ea26b3478f706f78b7f8c"
 RELAY_WS_URL="wss://sprout.up.railway.app"
 RELAY_HTTP_URL="https://sprout.up.railway.app"
-LEXEBOT_VERSION="v0.1.8"
+LEXEBOT_VERSION="v0.1.9"
 LEXEBOT_ARCHIVE="lexebot-${LEXEBOT_VERSION}-aarch64-apple-darwin.tar.gz"
 LEXEBOT_RELEASE_BASE="https://github.com/matbalez/lexebot/releases/download/${LEXEBOT_VERSION}"
 RUNNER_URL="https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/run.sh"
@@ -816,14 +816,21 @@ ensure_home_channel_for_existing_install() {
   local existing_channels bot_pubkey bot_nsec owner_key sprout_cli home_channel_id
 
   existing_channels="$(configured_channel_ids || true)"
-  [ -z "$existing_channels" ] || return 0
-
   bot_pubkey="$(configured_bot_pubkey)"
   [ -n "$bot_pubkey" ] || fail "could not determine LexeBot pubkey from ${CONFIG_FILE}"
   bot_nsec="$(configured_bot_private_key)"
   [ -n "$bot_nsec" ] || fail "could not determine LexeBot private key from ${CONFIG_FILE}"
   owner_key="$(configured_owner_key)"
   [ -n "$owner_key" ] || fail "could not determine Sprout owner key from ${CONFIG_FILE}"
+
+  if [ -n "$existing_channels" ]; then
+    # The first configured channel is the owner control surface. For current
+    # installs that is the LexeBot DM; older Flint Alpha work-channel entries
+    # were removed by normalize_config_channels before this runs.
+    home_channel_id="$(printf '%s\n' "$existing_channels" | awk '{print $1}')"
+    send_install_welcome_message "$bot_nsec" "$owner_key" "$home_channel_id"
+    return 0
+  fi
 
   sprout_cli="$(ensure_sprout_cli)"
   home_channel_id="$(sprout_open_home_dm "$sprout_cli" "$owner_key" "$bot_pubkey")"
