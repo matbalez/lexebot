@@ -84,9 +84,7 @@ installed version and supported commands. On a fresh install, it prints
 the command to start LexeBot later, then runs LexeBot in the foreground in the
 current terminal so startup logs are visible. On rerun, it detects an existing
 local install and asks whether to start that existing bot instead of generating
-a new identity. LexeBot derives the owner display name from the owner's public
-Sprout profile on startup and publishes the bot profile as
-`LexeBot[<owner display name without spaces>]`.
+a new identity. LexeBot publishes its bot profile as `LexeBot`.
 If the installer is newer than the local installed version, rerunning the
 installer upgrades the binary and runner while preserving the existing local
 config and bot identity. During that upgrade, the legacy Flint Alpha channel
@@ -181,17 +179,13 @@ Optional:
 LEXEBOT_MAX_SEND_AMOUNT=100000
 LEXEBOT_INVOICE_EXPIRATION_SECS=3600
 LEXEBOT_NETWORK=mainnet
-LEXEBOT_OWNER_DISPLAY_NAME=Mat
 LEXEBOT_KUDOS_BOT_PUBKEY=<kudos-bot-pubkey-hex>
 ```
 
 `LEXEBOT_MAX_SEND_AMOUNT` is expressed in ₿ base units. If set, `send` commands
 above that amount are rejected.
 
-On startup, LexeBot tries to read the owner's Sprout/Nostr profile and publishes
-its bot profile as `LexeBot[<owner display name without spaces>]`, for example
-`LexeBot[Mat]`. Set `LEXEBOT_OWNER_DISPLAY_NAME` only as an optional override or
-fallback if profile lookup is unavailable.
+On startup, LexeBot publishes its bot profile as `LexeBot`.
 
 The published profile also includes a public `lexebot` discovery object:
 

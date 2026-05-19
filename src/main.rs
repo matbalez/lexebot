@@ -30,7 +30,6 @@ use url::Url as WsUrl;
 const DEFAULT_RELAY_URL: &str = "ws://localhost:3000";
 const AUTO_KUDOS_SUBSCRIPTION_ID: &str = "lexebot-auto-kudos";
 const OWNER_DM_SUBSCRIPTION_ID: &str = "lexebot-owner-dm";
-const OWNER_PROFILE_SUBSCRIPTION_ID: &str = "lexebot-owner-profile";
 const AUTO_KUDOS_COMMAND_KIND: u16 = 21_000;
 const AUTO_KUDOS_RESULT_KIND: u16 = 21_001;
 const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
@@ -335,7 +334,6 @@ struct Config {
     channel_ids: Vec<String>,
     bot_keys: Keys,
     owner_pubkey: PublicKey,
-    owner_display_name_override: Option<String>,
     owner_auth_tag: Option<Tag>,
     kudos_bot_pubkey: Option<PublicKey>,
 }
@@ -347,9 +345,6 @@ impl Config {
         let channel_ids = channel_ids_from_env()?;
         let bot_keys = Keys::parse(&required_env("SPROUT_BOT_PRIVATE_KEY")?)
             .context("SPROUT_BOT_PRIVATE_KEY must be an nsec or hex private key")?;
-        let owner_display_name_override = std::env::var("LEXEBOT_OWNER_DISPLAY_NAME")
-            .ok()
-            .and_then(|value| clean_display_name(&value));
         let kudos_bot_pubkey = optional_pubkey_env("LEXEBOT_KUDOS_BOT_PUBKEY")?;
 
         let auth_mode =
@@ -367,7 +362,6 @@ impl Config {
             channel_ids,
             bot_keys,
             owner_pubkey,
-            owner_display_name_override,
             owner_auth_tag,
             kudos_bot_pubkey,
         })
@@ -456,93 +450,8 @@ async fn publish_presence(ws: &mut Ws, config: &Config, status: &str) -> Result<
     send_json(ws, json!(["EVENT", event])).await
 }
 
-async fn resolve_bot_display_name(ws: &mut Ws, config: &Config) -> String {
-    if let Some(owner_name) = &config.owner_display_name_override {
-        return owner_lexebot_display_name(owner_name);
-    }
-
-    match fetch_owner_profile_display_name(ws, config.owner_pubkey).await {
-        Ok(Some(owner_name)) => owner_lexebot_display_name(&owner_name),
-        Ok(None) => {
-            eprintln!("owner profile display name not found; publishing default LexeBot profile");
-            BOT_DISPLAY_NAME.to_string()
-        }
-        Err(err) => {
-            eprintln!("could not resolve owner profile display name: {err:#}");
-            BOT_DISPLAY_NAME.to_string()
-        }
-    }
-}
-
-async fn fetch_owner_profile_display_name(
-    ws: &mut Ws,
-    owner_pubkey: PublicKey,
-) -> Result<Option<String>> {
-    let filter = Filter::new()
-        .kind(Kind::Custom(0))
-        .author(owner_pubkey)
-        .limit(1);
-    send_json(ws, json!(["REQ", OWNER_PROFILE_SUBSCRIPTION_ID, filter])).await?;
-
-    loop {
-        let text = next_text(ws, Duration::from_secs(5)).await?;
-        let value: Value = serde_json::from_str(&text)?;
-        match value.get(0).and_then(Value::as_str) {
-            Some("EVENT")
-                if value.get(1).and_then(Value::as_str) == Some(OWNER_PROFILE_SUBSCRIPTION_ID) =>
-            {
-                let event_value = value
-                    .get(2)
-                    .ok_or_else(|| anyhow!("EVENT message missing event payload"))?;
-                let event = Event::from_json(event_value.to_string())?;
-                if event.pubkey == owner_pubkey && event.kind == Kind::Custom(0) {
-                    close_subscription(ws, OWNER_PROFILE_SUBSCRIPTION_ID).await?;
-                    return Ok(owner_display_name_from_metadata(&event.content));
-                }
-            }
-            Some("EOSE")
-                if value.get(1).and_then(Value::as_str) == Some(OWNER_PROFILE_SUBSCRIPTION_ID) =>
-            {
-                close_subscription(ws, OWNER_PROFILE_SUBSCRIPTION_ID).await?;
-                return Ok(None);
-            }
-            Some("NOTICE") => eprintln!("relay: {value}"),
-            Some("CLOSED")
-                if value.get(1).and_then(Value::as_str) == Some(OWNER_PROFILE_SUBSCRIPTION_ID) =>
-            {
-                let reason = value.get(2).and_then(Value::as_str).unwrap_or("");
-                eprintln!("relay closed owner profile lookup: {reason}");
-                return Ok(None);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn owner_display_name_from_metadata(content: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(content).ok()?;
-    ["display_name", "displayName", "name"]
-        .iter()
-        .find_map(|field| value.get(field).and_then(Value::as_str))
-        .and_then(clean_display_name)
-}
-
-fn owner_lexebot_display_name(owner_name: &str) -> String {
-    clean_display_name(owner_name)
-        .map(|name| format!("LexeBot[{}]", name.replace(' ', "")))
-        .unwrap_or_else(|| BOT_DISPLAY_NAME.to_string())
-}
-
-fn clean_display_name(value: &str) -> Option<String> {
-    let collapsed = value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(80)
-        .collect::<String>();
-    (!collapsed.is_empty()).then_some(collapsed)
+async fn resolve_bot_display_name(_ws: &mut Ws, _config: &Config) -> String {
+    BOT_DISPLAY_NAME.to_string()
 }
 
 fn auth_tag_json(tag: &Tag) -> Value {
@@ -1309,10 +1218,6 @@ async fn send_json(ws: &mut Ws, value: Value) -> Result<()> {
     Ok(())
 }
 
-async fn close_subscription(ws: &mut Ws, subscription_id: &str) -> Result<()> {
-    send_json(ws, json!(["CLOSE", subscription_id])).await
-}
-
 fn required_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} is required"))
 }
@@ -1503,7 +1408,6 @@ mod tests {
             channel_ids: vec!["test-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
-            owner_display_name_override: None,
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
         };
@@ -1524,7 +1428,6 @@ mod tests {
             channel_ids: vec!["test-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
-            owner_display_name_override: None,
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
         };
@@ -1549,7 +1452,6 @@ mod tests {
             channel_ids: vec!["control-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
-            owner_display_name_override: None,
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
         };
@@ -1599,7 +1501,6 @@ mod tests {
             channel_ids: vec!["control-channel".to_string(), "other-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
-            owner_display_name_override: None,
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
         };
@@ -1633,7 +1534,6 @@ mod tests {
             channel_ids: vec!["control-channel".to_string()],
             bot_keys,
             owner_pubkey: Keys::generate().public_key(),
-            owner_display_name_override: None,
             owner_auth_tag: None,
             kudos_bot_pubkey: Some(kudos_keys.public_key()),
         };
@@ -1661,7 +1561,6 @@ mod tests {
             channel_ids: vec!["test-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
-            owner_display_name_override: None,
             owner_auth_tag: None,
             kudos_bot_pubkey: Some(kudos_keys.public_key()),
         };
@@ -1720,7 +1619,6 @@ mod tests {
             channel_ids: vec!["test-channel".to_string()],
             bot_keys,
             owner_pubkey: owner_keys.public_key(),
-            owner_display_name_override: None,
             owner_auth_tag: None,
             kudos_bot_pubkey: Some(kudos_keys.public_key()),
         };
@@ -1779,31 +1677,6 @@ mod tests {
 
         assert_eq!(owner, owner_keys.public_key());
         assert_eq!(tag.as_slice().first().map(String::as_str), Some("auth"));
-    }
-
-    #[test]
-    fn owner_lexebot_display_name_uses_owner_profile_name() {
-        assert_eq!(owner_lexebot_display_name("Mat"), "LexeBot[Mat]");
-        assert_eq!(
-            owner_lexebot_display_name("  Mat   Balez  "),
-            "LexeBot[MatBalez]"
-        );
-        assert_eq!(owner_lexebot_display_name(" \n\t "), "LexeBot");
-    }
-
-    #[test]
-    fn owner_display_name_from_metadata_prefers_display_name() {
-        assert_eq!(
-            owner_display_name_from_metadata(
-                r#"{"name":"mattyb","display_name":"Mat","displayName":"Mat B"}"#
-            ),
-            Some("Mat".to_string())
-        );
-        assert_eq!(
-            owner_display_name_from_metadata(r#"{"name":"mattyb"}"#),
-            Some("mattyb".to_string())
-        );
-        assert_eq!(owner_display_name_from_metadata("not json"), None);
     }
 
     #[test]
