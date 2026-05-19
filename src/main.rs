@@ -671,9 +671,15 @@ async fn handle_encrypted_auto_kudos(ws: &mut Ws, runtime: &Runtime, event: &Eve
             return Ok(());
         }
     };
+    let receipt = auto_kudos_receipt(&command);
 
     match tokio::time::timeout(AUTO_KUDOS_PAYMENT_TIMEOUT, runtime.lexe.execute(command)).await {
         Ok(Ok(_)) => {
+            if let Some(receipt) = receipt {
+                if let Err(err) = send_owner_dm_message(ws, &runtime.config, &receipt).await {
+                    eprintln!("could not send auto-kudos owner DM receipt: {err:#}");
+                }
+            }
             send_auto_kudos_result(ws, &runtime.config, event, true).await?;
             eprintln!("processed encrypted auto-kudos command {command_event_id}");
         }
@@ -691,6 +697,15 @@ async fn handle_encrypted_auto_kudos(ws: &mut Ws, runtime: &Runtime, event: &Eve
     }
 
     Ok(())
+}
+
+async fn send_owner_dm_message(ws: &mut Ws, config: &Config, content: &str) -> Result<()> {
+    let Some(channel_id) = owner_dm_channel_id(config) else {
+        return Ok(());
+    };
+    let event = build_message(channel_id, content, &[config.owner_pubkey.to_hex()])?
+        .sign_with_keys(&config.bot_keys)?;
+    send_json(ws, json!(["EVENT", event])).await
 }
 
 async fn send_auto_kudos_result(
@@ -803,13 +818,55 @@ fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCom
         .filter(|payable| !payable.trim().is_empty())
         .ok_or_else(|| anyhow!("auto-kudos command missing payable"))?
         .to_string();
+    let receiver_display_name = auto_kudos_receiver_label(
+        value.get("receiver_display_name").and_then(Value::as_str),
+        receiver,
+    );
 
     Ok(BotCommand::AutoKudosSend {
         sender,
         receiver,
+        receiver_display_name,
         amount,
         payable,
     })
+}
+
+fn auto_kudos_receiver_label(value: Option<&str>, receiver: PublicKey) -> String {
+    value
+        .and_then(clean_auto_kudos_receiver_label)
+        .unwrap_or_else(|| format!("@{}", receiver.to_hex().chars().take(8).collect::<String>()))
+}
+
+fn clean_auto_kudos_receiver_label(value: &str) -> Option<String> {
+    let value = value.trim();
+    let label = value.strip_prefix('@').unwrap_or(value);
+    let label = label.trim_end_matches([',', '.', '!', '?', ':', ';']);
+    if label.is_empty()
+        || label.len() > 80
+        || label
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return None;
+    }
+    Some(format!("@{label}"))
+}
+
+fn auto_kudos_receipt(command: &BotCommand) -> Option<String> {
+    let BotCommand::AutoKudosSend {
+        receiver_display_name,
+        amount,
+        ..
+    } = command
+    else {
+        return None;
+    };
+    Some(format!(
+        "{} kudos sent to {}",
+        format_amount(*amount),
+        receiver_display_name
+    ))
 }
 
 fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result<EventBuilder> {
@@ -838,6 +895,7 @@ enum BotCommand {
     AutoKudosSend {
         sender: PublicKey,
         receiver: PublicKey,
+        receiver_display_name: String,
         amount: u64,
         payable: String,
     },
@@ -905,6 +963,10 @@ fn parse_auto_kudos_command(tokens: &[&str]) -> std::result::Result<BotCommand, 
                 .map_err(|_| "auto-kudos sender must be a hex pubkey".to_string())?,
             receiver: PublicKey::from_hex(receiver)
                 .map_err(|_| "auto-kudos receiver must be a hex pubkey".to_string())?,
+            receiver_display_name: format!(
+                "@{}",
+                receiver.chars().take(8).collect::<String>()
+            ),
             amount: parse_amount_token(amount)?,
             payable: (*payable).to_string(),
         }),
@@ -1396,6 +1458,10 @@ mod tests {
             Ok(BotCommand::AutoKudosSend {
                 sender,
                 receiver,
+                receiver_display_name: format!(
+                    "@{}",
+                    receiver.to_hex().chars().take(8).collect::<String>()
+                ),
                 amount: 500,
                 payable: "lno1abc".to_string()
             })
@@ -1602,6 +1668,7 @@ mod tests {
         let command = BotCommand::AutoKudosSend {
             sender: owner_keys.public_key(),
             receiver,
+            receiver_display_name: "@Receiver".to_string(),
             amount: 1,
             payable: "lno1abc".to_string(),
         };
@@ -1628,6 +1695,7 @@ mod tests {
             "type": "auto-kudos",
             "sender_pubkey": owner_keys.public_key().to_hex(),
             "receiver_pubkey": receiver.to_hex(),
+            "receiver_display_name": "@DK",
             "amount": 21,
             "payable": "lno1abc",
             "source_event_id": "c87370826bf84cbf48bd8e5c50d485a5df251a8b76595cc60916783ab4f5a422",
@@ -1663,11 +1731,41 @@ mod tests {
             BotCommand::AutoKudosSend {
                 sender: owner_keys.public_key(),
                 receiver,
+                receiver_display_name: "@DK".to_string(),
                 amount: 21,
                 payable: "lno1abc".to_string(),
             }
         );
         assert!(command_authorized(&command, event.pubkey, &config));
+    }
+
+    #[test]
+    fn auto_kudos_receipt_uses_receiver_display_name() {
+        let command = BotCommand::AutoKudosSend {
+            sender: Keys::generate().public_key(),
+            receiver: Keys::generate().public_key(),
+            receiver_display_name: "@DK".to_string(),
+            amount: 21,
+            payable: "lno1abc".to_string(),
+        };
+
+        assert_eq!(
+            auto_kudos_receipt(&command).as_deref(),
+            Some("₿21 kudos sent to @DK")
+        );
+    }
+
+    #[test]
+    fn auto_kudos_receiver_label_is_sanitized() {
+        let receiver = Keys::generate().public_key();
+        assert_eq!(
+            auto_kudos_receiver_label(Some("DK!"), receiver),
+            "@DK".to_string()
+        );
+        assert_eq!(
+            auto_kudos_receiver_label(Some("@D K"), receiver),
+            format!("@{}", receiver.to_hex().chars().take(8).collect::<String>())
+        );
     }
 
     #[test]
