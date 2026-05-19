@@ -1,5 +1,8 @@
 //! A deterministic Sprout bot for controlling one owner's Lexe wallet.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -35,6 +38,9 @@ const AUTO_KUDOS_RESULT_KIND: u16 = 21_001;
 const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
 const PRESENCE_UPDATE_KIND: u16 = 20_001;
 const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/matbalez/lexebot/releases/latest";
 const BOT_NAME: &str = "lexebot";
 const BOT_DISPLAY_NAME: &str = "LexeBot";
 const BOT_ABOUT: &str = "A deterministic Sprout bot that lets one owner control a Lexe wallet.";
@@ -278,6 +284,9 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let mut presence_interval = tokio::time::interval(PRESENCE_REFRESH_INTERVAL);
     presence_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     presence_interval.tick().await;
+    let mut update_check_interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
+    update_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    update_check_interval.tick().await;
 
     eprintln!("listening for owner DM commands and encrypted auto-kudos commands");
     if runtime.config.channel_ids.len() > 1 {
@@ -285,6 +294,9 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
             "ignoring {} extra configured plaintext channel(s); manual wallet commands only run in the owner DM",
             runtime.config.channel_ids.len() - 1
         );
+    }
+    if let Err(err) = maybe_notify_update_available(&mut ws, &runtime.config).await {
+        eprintln!("update check failed: {err:#}");
     }
 
     loop {
@@ -296,6 +308,11 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
             }
             _ = presence_interval.tick() => {
                 publish_presence(&mut ws, &runtime.config, "online").await?;
+            }
+            _ = update_check_interval.tick() => {
+                if let Err(err) = maybe_notify_update_available(&mut ws, &runtime.config).await {
+                    eprintln!("update check failed: {err:#}");
+                }
             }
             next = ws.next() => {
                 let Some(message) = next else { bail!("relay closed the WebSocket"); };
@@ -357,6 +374,7 @@ struct Config {
     owner_pubkey: PublicKey,
     owner_auth_tag: Option<Tag>,
     kudos_bot_pubkey: Option<PublicKey>,
+    update_check_enabled: bool,
 }
 
 impl Config {
@@ -367,6 +385,7 @@ impl Config {
         let bot_keys = Keys::parse(&required_env("SPROUT_BOT_PRIVATE_KEY")?)
             .context("SPROUT_BOT_PRIVATE_KEY must be an nsec or hex private key")?;
         let kudos_bot_pubkey = optional_pubkey_env("LEXEBOT_KUDOS_BOT_PUBKEY")?;
+        let update_check_enabled = update_check_enabled_from_env()?;
 
         let auth_mode =
             std::env::var("SPROUT_BOT_AUTH_MODE").unwrap_or_else(|_| "standalone".to_string());
@@ -385,6 +404,7 @@ impl Config {
             owner_pubkey,
             owner_auth_tag,
             kudos_bot_pubkey,
+            update_check_enabled,
         })
     }
 }
@@ -636,6 +656,129 @@ async fn send_owner_dm_message(ws: &mut Ws, config: &Config, content: &str) -> R
     let event = build_message(channel_id, content, &[config.owner_pubkey.to_hex()])?
         .sign_with_keys(&config.bot_keys)?;
     send_json(ws, json!(["EVENT", event])).await
+}
+
+async fn maybe_notify_update_available(ws: &mut Ws, config: &Config) -> Result<()> {
+    if !config.update_check_enabled {
+        return Ok(());
+    }
+
+    let Some(latest_version) = fetch_latest_release_version().await? else {
+        return Ok(());
+    };
+    let current_version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    if !version_is_newer(&latest_version, &current_version) {
+        return Ok(());
+    }
+
+    let state_path = update_notification_state_path()?;
+    if last_notified_update_version(&state_path).as_deref() == Some(latest_version.as_str()) {
+        return Ok(());
+    }
+
+    let notice = update_available_notice(&latest_version, &current_version);
+    if owner_dm_channel_id(config).is_some() {
+        send_owner_dm_message(ws, config, &notice).await?;
+    } else {
+        eprintln!("{notice}");
+    }
+    remember_notified_update_version(&state_path, &latest_version)?;
+    Ok(())
+}
+
+async fn fetch_latest_release_version() -> Result<Option<String>> {
+    let user_agent = format!("LexeBot/{}", env!("CARGO_PKG_VERSION"));
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new("curl")
+            .arg("-fsSL")
+            .arg("-H")
+            .arg("Accept: application/vnd.github+json")
+            .arg("-H")
+            .arg(format!("User-Agent: {user_agent}"))
+            .arg(LATEST_RELEASE_API_URL)
+            .output()
+    })
+    .await
+    .context("update check task failed")?
+    .context("failed to run curl for update check")?;
+
+    if !output.status.success() {
+        bail!(
+            "GitHub latest release request failed with {}",
+            output.status
+        );
+    }
+
+    let body =
+        String::from_utf8(output.stdout).context("GitHub latest release response is not UTF-8")?;
+    parse_latest_release_version(&body)
+}
+
+fn parse_latest_release_version(body: &str) -> Result<Option<String>> {
+    let value: Value =
+        serde_json::from_str(body).context("GitHub latest release response is not JSON")?;
+    Ok(value
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(ToString::to_string))
+}
+
+fn version_is_newer(candidate: &str, current: &str) -> bool {
+    let Some(candidate) = parse_version_tag(candidate) else {
+        return false;
+    };
+    let Some(current) = parse_version_tag(current) else {
+        return false;
+    };
+    candidate > current
+}
+
+fn parse_version_tag(tag: &str) -> Option<(u64, u64, u64)> {
+    let tag = tag.trim().strip_prefix('v').unwrap_or_else(|| tag.trim());
+    let mut parts = tag.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    parts.next().is_none().then_some((major, minor, patch))
+}
+
+fn update_available_notice(latest_version: &str, current_version: &str) -> String {
+    format!(
+        "LexeBot {latest_version} is available. You are running {current_version}.\n\
+Upgrade:\n\
+curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh | bash"
+    )
+}
+
+fn update_notification_state_path() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("LEXEBOT_UPDATE_STATE_FILE") {
+        if !path.trim().is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    let home = std::env::var("HOME").context("HOME is required for LexeBot update state")?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("lexebot")
+        .join("last-notified-update"))
+}
+
+fn last_notified_update_version(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn remember_notified_update_version(path: &Path, version: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create update state dir {}", parent.display()))?;
+    }
+    fs::write(path, format!("{version}\n"))
+        .with_context(|| format!("failed to write update state file {}", path.display()))
 }
 
 async fn send_auto_kudos_result(
@@ -1320,6 +1463,19 @@ fn optional_pubkey_env(name: &str) -> Result<Option<PublicKey>> {
         .transpose()
 }
 
+fn update_check_enabled_from_env() -> Result<bool> {
+    match std::env::var("LEXEBOT_UPDATE_CHECK") {
+        Ok(value) if value.trim().is_empty() => Ok(true),
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" | "off" => Ok(false),
+            "1" | "true" | "yes" | "on" => Ok(true),
+            _ => bail!("LEXEBOT_UPDATE_CHECK must be 0/1, true/false, yes/no, or on/off"),
+        },
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(err) => Err(err).context("LEXEBOT_UPDATE_CHECK is not valid Unicode"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1444,6 +1600,7 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
+            update_check_enabled: true,
         };
 
         assert!(event_mentions_bot(&event, &config));
@@ -1464,6 +1621,7 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
+            update_check_enabled: true,
         };
 
         assert!(!event_mentions_bot(&event, &config));
@@ -1488,6 +1646,7 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
+            update_check_enabled: true,
         };
 
         assert!(!event_mentions_bot(&event, &config));
@@ -1537,6 +1696,7 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_auth_tag: None,
             kudos_bot_pubkey: None,
+            update_check_enabled: true,
         };
 
         assert!(!event_addresses_bot(&control_event, &config));
@@ -1570,6 +1730,7 @@ mod tests {
             owner_pubkey: Keys::generate().public_key(),
             owner_auth_tag: None,
             kudos_bot_pubkey: Some(kudos_keys.public_key()),
+            update_check_enabled: true,
         };
 
         assert!(event_addresses_bot(&event, &config));
@@ -1597,6 +1758,7 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_auth_tag: None,
             kudos_bot_pubkey: Some(kudos_keys.public_key()),
+            update_check_enabled: true,
         };
         let command = BotCommand::AutoKudosSend {
             sender: owner_keys.public_key(),
@@ -1655,6 +1817,7 @@ mod tests {
             owner_pubkey: owner_keys.public_key(),
             owner_auth_tag: None,
             kudos_bot_pubkey: Some(kudos_keys.public_key()),
+            update_check_enabled: true,
         };
 
         let command = encrypted_auto_kudos_command(&config, &event).unwrap();
@@ -1723,6 +1886,37 @@ mod tests {
 
         assert_eq!(owner, owner_keys.public_key());
         assert_eq!(tag.as_slice().first().map(String::as_str), Some("auth"));
+    }
+
+    #[test]
+    fn parses_latest_release_version_from_github_json() {
+        assert_eq!(
+            parse_latest_release_version(r#"{"tag_name":"v0.1.17"}"#).unwrap(),
+            Some("v0.1.17".to_string())
+        );
+        assert_eq!(
+            parse_latest_release_version(r#"{"tag_name":""}"#).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn compares_semver_release_tags() {
+        assert!(version_is_newer("v0.1.17", "v0.1.16"));
+        assert!(version_is_newer("v0.2.0", "v0.1.99"));
+        assert!(!version_is_newer("v0.1.16", "v0.1.16"));
+        assert!(!version_is_newer("v0.1.15", "v0.1.16"));
+        assert!(!version_is_newer("latest", "v0.1.16"));
+    }
+
+    #[test]
+    fn formats_update_available_notice() {
+        assert_eq!(
+            update_available_notice("v0.1.17", "v0.1.16"),
+            "LexeBot v0.1.17 is available. You are running v0.1.16.\n\
+Upgrade:\n\
+curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh | bash"
+        );
     }
 
     #[test]
