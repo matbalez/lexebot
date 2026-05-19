@@ -46,13 +46,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.15-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.15/lexebot-v0.1.15-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.15-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.15/lexebot-v0.1.15-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.15-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.16-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.16/lexebot-v0.1.16-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.16-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.16/lexebot-v0.1.16-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.16-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.15-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.16-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
@@ -214,8 +214,10 @@ Successful auto-kudos payments are silent in chat, then LexeBot sends an
 encrypted global ephemeral kind `21001` result back to Kudos so Kudos can post a
 terse public confirmation. LexeBot also writes a receipt such as
 `₿21 kudos sent to @DK` into the owner's configured LexeBot DM when that DM is
-available. The result event is only p-tagged to Kudos; request correlation stays
-inside the encrypted payload. Failures are logged to the LexeBot terminal.
+available. The Lexe payment message is `Kudos!`, and the sender's private
+personal note is `You sent a Kudos to <name>`. The result event is only p-tagged
+to Kudos; request correlation stays inside the encrypted payload. Failures are
+logged to the LexeBot terminal.
 Normal wallet commands still require the owner pubkey and still happen in a
 configured channel/DM.
 

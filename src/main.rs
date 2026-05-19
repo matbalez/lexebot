@@ -111,13 +111,28 @@ impl LexeClient {
             BotCommand::GetBalance => self.get_balance().await.map(Some),
             BotCommand::GetBolt12 => self.get_bolt12().await.map(Some),
             BotCommand::CreateInvoice { amount } => self.create_invoice(amount).await.map(Some),
-            BotCommand::Send { amount, payable } => {
-                self.send_payment(amount, payable).await.map(Some)
-            }
+            BotCommand::Send { amount, payable } => self
+                .send_payment(
+                    amount,
+                    payable,
+                    None,
+                    Some("LexeBot channel command".to_string()),
+                )
+                .await
+                .map(Some),
             BotCommand::AutoKudosSend {
-                amount, payable, ..
+                amount,
+                payable,
+                receiver_display_name,
+                ..
             } => {
-                self.send_payment(amount, payable).await?;
+                self.send_payment(
+                    amount,
+                    payable,
+                    Some("Kudos!".to_string()),
+                    Some(auto_kudos_personal_note(&receiver_display_name)),
+                )
+                .await?;
                 Ok(None)
             }
         }
@@ -175,7 +190,13 @@ impl LexeClient {
         Ok(response.offer.to_string())
     }
 
-    async fn send_payment(&self, amount: u64, payable: String) -> Result<String> {
+    async fn send_payment(
+        &self,
+        amount: u64,
+        payable: String,
+        message: Option<String>,
+        personal_note: Option<String>,
+    ) -> Result<String> {
         if let Some(max) = self.max_send_amount {
             if amount > max {
                 bail!(
@@ -192,8 +213,8 @@ impl LexeClient {
             .pay(PayRequest {
                 payable,
                 amount: Some(amount),
-                message: None,
-                personal_note: Some("LexeBot channel command".to_string()),
+                message,
+                personal_note,
             })
             .await?;
 
@@ -776,6 +797,19 @@ fn auto_kudos_receipt(command: &BotCommand) -> Option<String> {
         format_amount(*amount),
         receiver_display_name
     ))
+}
+
+fn auto_kudos_personal_note(receiver_display_name: &str) -> String {
+    let name = receiver_display_name
+        .trim()
+        .trim_start_matches('@')
+        .trim_end_matches([',', '.', '!', '?', ':', ';']);
+    let name = if name.is_empty() {
+        receiver_display_name.trim()
+    } else {
+        name
+    };
+    format!("You sent a Kudos to {name}")
 }
 
 fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result<EventBuilder> {
@@ -1650,6 +1684,18 @@ mod tests {
         assert_eq!(
             auto_kudos_receipt(&command).as_deref(),
             Some("₿21 kudos sent to @DK")
+        );
+    }
+
+    #[test]
+    fn auto_kudos_personal_note_uses_receiver_display_name_without_at_prefix() {
+        assert_eq!(
+            auto_kudos_personal_note("@DK"),
+            "You sent a Kudos to DK".to_string()
+        );
+        assert_eq!(
+            auto_kudos_personal_note("@Moneyball,"),
+            "You sent a Kudos to Moneyball".to_string()
         );
     }
 
