@@ -1,8 +1,8 @@
 # LexeBot
 
 A deterministic Sprout bot that runs locally, receives encrypted auto-kudos
-commands, and optionally lets one configured owner control a Lexe wallet from a
-private Sprout channel.
+commands, and lets one configured owner control a Lexe wallet through encrypted
+Sprout direct messages.
 
 LexeBot is not AI-powered. It holds a Nostr bot key for Sprout messages and a
 Lexe SDK client credential string supplied locally by the user. It only accepts
@@ -11,24 +11,21 @@ the owner pubkey is derived from `SPROUT_OWNER_PRIVATE_KEY`.
 
 ## Commands
 
-Commands require an explicit mention tag for the bot pubkey. In Sprout, select
-LexeBot from mention autocomplete. If the bot profile is personalized, the
-visible mention includes the owner display name without spaces, for example
-`@LexeBot[Mat] get balance`.
+Manual wallet commands must be sent by the configured owner as encrypted Sprout
+direct messages to LexeBot. Plain channel messages are ignored for wallet
+commands, including messages in the LexeBot DM channel.
 
 ```text
-@LexeBot get balance
-@LexeBot get BOLT12
-@LexeBot create invoice for ₿1,000
-@LexeBot send ₿500 to <payment-target>
+get balance
+get BOLT12
+create invoice for ₿1,000
+send ₿500 to <payment-target>
 ```
 
 `get BOLT12` creates and returns a reusable Lexe BOLT12 offer with no minimum
 amount.
 
-`get balance` and `create invoice` return sensitive wallet details by opening a
-Sprout DM with the owner and sending the full response there. The public channel
-only receives a short acknowledgement.
+Command replies are sent back as encrypted Sprout direct messages.
 
 `<payment-target>` is passed to Lexe's generic payment parser. Use whatever the
 installed Lexe Rust SDK accepts, such as a BOLT11 invoice, BOLT12 offer, Human

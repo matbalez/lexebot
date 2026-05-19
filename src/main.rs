@@ -1,7 +1,7 @@
 //! A deterministic Sprout bot for controlling one owner's Lexe wallet.
 
 use std::str::FromStr;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -30,7 +30,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url as WsUrl;
 
 const DEFAULT_RELAY_URL: &str = "ws://localhost:3000";
-const SUBSCRIPTION_ID: &str = "lexebot";
 const AUTO_KUDOS_SUBSCRIPTION_ID: &str = "lexebot-auto-kudos";
 const OWNER_DM_SUBSCRIPTION_ID: &str = "lexebot-owner-dm";
 const OWNER_PROFILE_SUBSCRIPTION_ID: &str = "lexebot-owner-profile";
@@ -41,7 +40,6 @@ const NIP17_GIFT_WRAP_KIND: u16 = 1_059;
 const NIP17_PRIVATE_DM_RUMOR_KIND: u16 = 14;
 const PRESENCE_UPDATE_KIND: u16 = 20_001;
 const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const DM_OPEN_KIND: u16 = 41_010;
 const BOT_NAME: &str = "lexebot";
 const BOT_DISPLAY_NAME: &str = "LexeBot";
 const BOT_ABOUT: &str = "A deterministic Sprout bot that lets one owner control a Lexe wallet.";
@@ -257,7 +255,6 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let bolt12_offer = runtime.lexe.create_bolt12_offer().await?;
     publish_profile(&mut ws, &runtime.config, &bot_display_name, &bolt12_offer).await?;
     publish_presence(&mut ws, &runtime.config, "online").await?;
-    subscribe_to_channels(&mut ws, &runtime.config.channel_ids).await?;
     subscribe_to_owner_dm_inbox(&mut ws, &runtime.config).await?;
     subscribe_to_auto_kudos_inbox(&mut ws, &runtime.config).await?;
 
@@ -266,11 +263,13 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     presence_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     presence_interval.tick().await;
 
-    eprintln!(
-        "listening for encrypted owner DM commands and {} configured channel(s): {}",
-        runtime.config.channel_ids.len(),
-        runtime.config.channel_ids.join(", ")
-    );
+    eprintln!("listening for encrypted owner DM commands and encrypted auto-kudos commands");
+    if !runtime.config.channel_ids.is_empty() {
+        eprintln!(
+            "ignoring {} configured plaintext channel(s); manual wallet commands require encrypted DMs",
+            runtime.config.channel_ids.len()
+        );
+    }
 
     loop {
         tokio::select! {
@@ -560,13 +559,6 @@ fn auth_tag_json(tag: &Tag) -> Value {
     )
 }
 
-async fn subscribe_to_channels(ws: &mut Ws, channel_ids: &[String]) -> Result<()> {
-    for channel_id in channel_ids {
-        subscribe_to_channel(ws, channel_id).await?;
-    }
-    Ok(())
-}
-
 async fn subscribe_to_auto_kudos_inbox(ws: &mut Ws, config: &Config) -> Result<()> {
     let bot_pubkey = config.bot_keys.public_key().to_hex();
     let filter = Filter::new()
@@ -581,20 +573,6 @@ async fn subscribe_to_owner_dm_inbox(ws: &mut Ws, config: &Config) -> Result<()>
         .kind(Kind::GiftWrap)
         .custom_tag(SingleLetterTag::lowercase(Alphabet::P), [bot_pubkey]);
     send_json(ws, json!(["REQ", OWNER_DM_SUBSCRIPTION_ID, filter])).await
-}
-
-async fn subscribe_to_channel(ws: &mut Ws, channel_id: &str) -> Result<()> {
-    let filter = Filter::new()
-        .kinds([Kind::Custom(9), Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND)])
-        .custom_tag(
-            SingleLetterTag::lowercase(Alphabet::H),
-            [channel_id.to_string()],
-        );
-    send_json(ws, json!(["REQ", subscription_id(channel_id), filter])).await
-}
-
-fn subscription_id(channel_id: &str) -> String {
-    format!("{SUBSCRIPTION_ID}:{channel_id}")
 }
 
 async fn handle_relay_text(
@@ -615,45 +593,18 @@ async fn handle_relay_text(
         Some("OK") => {}
         Some("EOSE") => {}
         Some("NOTICE") => eprintln!("relay: {value}"),
-        Some("CLOSED") => handle_closed(&runtime.config, &value)?,
+        Some("CLOSED") => handle_closed(&value)?,
         Some(other) => eprintln!("ignored relay message type: {other}"),
         None => eprintln!("ignored malformed relay message: {text}"),
     }
     Ok(())
 }
 
-fn handle_closed(config: &Config, value: &Value) -> Result<()> {
+fn handle_closed(value: &Value) -> Result<()> {
     let subscription = value.get(1).and_then(Value::as_str).unwrap_or("<unknown>");
     let reason = value.get(2).and_then(Value::as_str).unwrap_or("");
     eprintln!("relay closed subscription {subscription}: {reason}");
-
-    if let Some(channel_id) = subscription.strip_prefix(&format!("{SUBSCRIPTION_ID}:")) {
-        if reason.contains("not a channel member") {
-            print_membership_help(config, channel_id, reason);
-            bail!(
-                "LexeBot is authenticated on the relay but is not a member of channel {channel_id}"
-            );
-        }
-    } else if subscription == SUBSCRIPTION_ID && reason.contains("not a channel member") {
-        print_membership_help(config, "<channel-uuid>", reason);
-        bail!("LexeBot is authenticated on the relay but is not a member of this channel");
-    }
-
     Ok(())
-}
-
-fn print_membership_help(config: &Config, channel_id: &str, reason: &str) {
-    let bot_pubkey = config.bot_keys.public_key().to_hex();
-    eprintln!("{reason}");
-    eprintln!(
-        "Owner-attested auth can admit the bot to the relay, but the channel still checks the bot pubkey itself for membership."
-    );
-    eprintln!("Add this bot pubkey to the channel, then restart LexeBot:");
-    eprintln!("  bot pubkey: {bot_pubkey}");
-    eprintln!("  sprout channels add-member \\");
-    eprintln!("    --channel {channel_id} \\");
-    eprintln!("    --pubkey {bot_pubkey} \\");
-    eprintln!("    --role bot");
 }
 
 async fn maybe_reply(
@@ -672,86 +623,12 @@ async fn maybe_reply(
     if event.pubkey == runtime.config.bot_keys.public_key() || event.created_at < started_at {
         return Ok(());
     }
-    if !event_addresses_bot(event, &runtime.config) {
-        return Ok(());
-    }
     if event.kind == Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND) {
-        handle_encrypted_auto_kudos(ws, runtime, event).await?;
+        if event_addresses_bot(event, &runtime.config) {
+            handle_encrypted_auto_kudos(ws, runtime, event).await?;
+        }
         return Ok(());
     }
-    let Some(channel_id) = event_channel_id(event, &runtime.config) else {
-        return Ok(());
-    };
-
-    let is_control_channel = is_control_channel(&runtime.config, channel_id);
-    let mut reply_mentions = reply_mentions(event, &runtime.config);
-    let reply = match parse_command(&event.content) {
-        Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => {
-            let is_auto_kudos = command.is_auto_kudos();
-            let private_ack = command.private_channel_ack(&event.content);
-            if is_auto_kudos {
-                let command_event_id = event.id.to_hex();
-                match tokio::time::timeout(
-                    AUTO_KUDOS_PAYMENT_TIMEOUT,
-                    runtime.lexe.execute(command),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        send_auto_kudos_result(ws, &runtime.config, event, true).await?;
-                        eprintln!("processed silent auto-kudos command {command_event_id}");
-                    }
-                    Ok(Err(err)) => {
-                        send_auto_kudos_result(ws, &runtime.config, event, false).await?;
-                        eprintln!("silent auto-kudos command {command_event_id} failed: {err:#}");
-                    }
-                    Err(_) => {
-                        send_auto_kudos_result(ws, &runtime.config, event, false).await?;
-                        eprintln!(
-                            "silent auto-kudos command {command_event_id} timed out after {} seconds",
-                            AUTO_KUDOS_PAYMENT_TIMEOUT.as_secs()
-                        );
-                    }
-                }
-                return Ok(());
-            }
-            match runtime.lexe.execute(command).await {
-                Ok(Some(private_body)) if private_ack.is_some() && !is_control_channel => {
-                    match send_dm_message(
-                        ws,
-                        &runtime.config,
-                        runtime.config.owner_pubkey,
-                        &private_body,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            reply_mentions.push(runtime.config.owner_pubkey.to_hex());
-                            private_ack.expect("checked private ack")
-                        }
-                        Err(err) => {
-                            format!("Lexe command failed: could not send private response: {err:#}")
-                        }
-                    }
-                }
-                Ok(Some(reply)) => reply,
-                Ok(None) => return Ok(()),
-                Err(err) => format!("Lexe command failed: {err:#}"),
-            }
-        }
-        Ok(_) => {
-            "Only this LexeBot's configured owner or configured Kudos bot can use wallet commands."
-                .to_string()
-        }
-        Err(err) => format!("Invalid LexeBot command: {err}"),
-    };
-
-    let reply_event = build_message(channel_id, &reply, &reply_mentions)?
-        .sign_with_keys(&runtime.config.bot_keys)?;
-    let reply_event_id = reply_event.id.to_hex();
-
-    send_json(ws, json!(["EVENT", reply_event])).await?;
-    eprintln!("replied to {} with {}", event.id.to_hex(), reply_event_id);
     Ok(())
 }
 
@@ -851,21 +728,6 @@ async fn send_auto_kudos_result(
     send_json(ws, json!(["EVENT", event])).await
 }
 
-async fn send_dm_message(
-    ws: &mut Ws,
-    config: &Config,
-    recipient: PublicKey,
-    content: &str,
-) -> Result<()> {
-    let channel_id = open_dm_channel(ws, config, recipient).await?;
-    let event = build_message(&channel_id, content, &[recipient.to_hex()])?
-        .sign_with_keys(&config.bot_keys)?;
-    let event_id = event.id.to_hex();
-    send_json(ws, json!(["EVENT", event])).await?;
-    wait_for_ok(ws, &event_id).await?;
-    Ok(())
-}
-
 async fn send_encrypted_owner_dm_message(
     ws: &mut Ws,
     config: &Config,
@@ -900,38 +762,6 @@ create invoice for ₿1,000\n\
 send ₿500 to <payment-target>",
         env!("CARGO_PKG_VERSION")
     )
-}
-
-async fn open_dm_channel(ws: &mut Ws, config: &Config, recipient: PublicKey) -> Result<String> {
-    let dedupe = format!(
-        "lexebot-dm-{}-{}",
-        recipient.to_hex(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before UNIX epoch")?
-            .as_nanos()
-    );
-    let event = EventBuilder::new(
-        Kind::Custom(DM_OPEN_KIND),
-        "",
-        [
-            Tag::parse(&["p", &recipient.to_hex()])?,
-            Tag::parse(&["d", &dedupe])?,
-        ],
-    )
-    .sign_with_keys(&config.bot_keys)?;
-    let event_id = event.id.to_hex();
-
-    send_json(ws, json!(["EVENT", event])).await?;
-    let message = wait_for_ok_message(ws, &event_id).await?;
-    dm_channel_id_from_ok_message(&message)
-        .ok_or_else(|| anyhow!("DM open response did not include channel_id"))
-}
-
-fn dm_channel_id_from_ok_message(message: &str) -> Option<String> {
-    let response = message.strip_prefix("response:")?;
-    let value: Value = serde_json::from_str(response).ok()?;
-    value.get("channel_id")?.as_str().map(str::to_string)
 }
 
 fn command_authorized(command: &BotCommand, sender: PublicKey, config: &Config) -> bool {
@@ -1081,24 +911,6 @@ enum BotCommand {
     },
 }
 
-impl BotCommand {
-    fn is_auto_kudos(&self) -> bool {
-        matches!(self, Self::AutoKudosSend { .. })
-    }
-
-    fn private_channel_ack(&self, content: &str) -> Option<String> {
-        let subject = match self {
-            Self::GetBalance => "your balance",
-            Self::CreateInvoice { .. } => "your invoice",
-            _ => return None,
-        };
-        Some(format!(
-            "I've DM'ed you {subject} {}",
-            command_owner_mention(content)
-        ))
-    }
-}
-
 fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
     let tokens = content.split_whitespace().collect::<Vec<_>>();
     let command_start_index = if content.trim_start().starts_with('@') {
@@ -1125,27 +937,6 @@ fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
         "auto-kudos" => parse_auto_kudos_command(rest),
         _ => Err(command_help()),
     }
-}
-
-fn command_owner_mention(content: &str) -> String {
-    content
-        .split_whitespace()
-        .find(|token| is_bot_mention_token(token))
-        .and_then(lexebot_bracket_name)
-        .map(|name| format!("@{name}"))
-        .unwrap_or_else(|| "@owner".to_string())
-}
-
-fn lexebot_bracket_name(token: &str) -> Option<String> {
-    let cleaned = token
-        .trim_start_matches('@')
-        .trim_end_matches([',', '.', '!', '?', ':', ';']);
-    let lower = cleaned.to_ascii_lowercase();
-    if !lower.starts_with("lexebot[") || !lower.ends_with(']') {
-        return None;
-    }
-    let name = cleaned.get("lexebot[".len()..cleaned.len() - 1)?;
-    clean_display_name(name).map(|name| name.replace(' ', ""))
 }
 
 fn parse_get_command(tokens: &[&str]) -> std::result::Result<BotCommand, String> {
@@ -1255,9 +1046,7 @@ fn event_addresses_bot(event: &Event, config: &Config) -> bool {
     if event.kind == Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND) {
         return event_mentions_bot(event, config);
     }
-    event.kind == Kind::Custom(9)
-        && event_channel_id(event, config)
-            .is_some_and(|channel_id| is_control_channel(config, channel_id))
+    false
 }
 
 fn rumor_mentions_pubkey(rumor: &UnsignedEvent, pubkey: PublicKey) -> bool {
@@ -1267,49 +1056,6 @@ fn rumor_mentions_pubkey(rumor: &UnsignedEvent, pubkey: PublicKey) -> bool {
         parts.first().map(String::as_str) == Some("p")
             && parts.get(1).map(String::as_str) == Some(pubkey.as_str())
     })
-}
-
-fn event_channel_id<'a>(event: &'a Event, config: &Config) -> Option<&'a str> {
-    event.tags.iter().find_map(|tag| {
-        let parts = tag.as_slice();
-        if parts.first().map(String::as_str) != Some("h") {
-            return None;
-        }
-        let channel_id = parts.get(1)?.as_str();
-        config
-            .channel_ids
-            .iter()
-            .any(|configured| configured == channel_id)
-            .then_some(channel_id)
-    })
-}
-
-fn is_control_channel(config: &Config, channel_id: &str) -> bool {
-    config
-        .channel_ids
-        .first()
-        .is_some_and(|configured| configured == channel_id)
-}
-
-fn reply_mentions(event: &Event, config: &Config) -> Vec<String> {
-    let bot_pubkey = config.bot_keys.public_key().to_hex();
-    let mut pubkeys: Vec<String> = Vec::new();
-
-    for tag in event.tags.iter() {
-        let parts = tag.as_slice();
-        if parts.first().map(String::as_str) != Some("p") {
-            continue;
-        }
-        let Some(pubkey) = parts.get(1) else {
-            continue;
-        };
-        if pubkey == &bot_pubkey || pubkeys.contains(pubkey) {
-            continue;
-        }
-        pubkeys.push(pubkey.clone());
-    }
-
-    pubkeys
 }
 
 fn owner_identity_from_attestation(bot_keys: &Keys) -> Result<(PublicKey, Option<Tag>)> {
@@ -1783,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn text_mention_in_configured_channel_triggers() {
+    fn text_mention_in_configured_channel_does_not_trigger() {
         let bot_keys = Keys::generate();
         let owner_keys = Keys::generate();
         let event = EventBuilder::new(
@@ -1804,11 +1550,11 @@ mod tests {
         };
 
         assert!(!event_mentions_bot(&event, &config));
-        assert!(event_addresses_bot(&event, &config));
+        assert!(!event_addresses_bot(&event, &config));
     }
 
     #[test]
-    fn user_commands_only_trigger_in_control_channel() {
+    fn plaintext_user_commands_do_not_trigger_in_any_channel() {
         let bot_keys = Keys::generate();
         let owner_keys = Keys::generate();
         let control_event = EventBuilder::new(
@@ -1845,7 +1591,7 @@ mod tests {
             kudos_bot_pubkey: None,
         };
 
-        assert!(event_addresses_bot(&control_event, &config));
+        assert!(!event_addresses_bot(&control_event, &config));
         assert!(!event_addresses_bot(&other_event, &config));
         assert!(!event_addresses_bot(&mentioned_other_event, &config));
     }
@@ -1947,29 +1693,6 @@ mod tests {
         assert!(encrypted_owner_dm_plaintext(&config, &gift_wrap)
             .await
             .is_err());
-    }
-
-    #[test]
-    fn event_channel_must_be_configured() {
-        let owner_keys = Keys::generate();
-        let event = EventBuilder::new(
-            Kind::Custom(9),
-            "@LexeBot get balance",
-            [Tag::parse(&["h", "second-channel"]).unwrap()],
-        )
-        .sign_with_keys(&owner_keys)
-        .unwrap();
-        let config = Config {
-            relay_url: DEFAULT_RELAY_URL.to_string(),
-            channel_ids: vec!["first-channel".to_string(), "second-channel".to_string()],
-            bot_keys: Keys::generate(),
-            owner_pubkey: owner_keys.public_key(),
-            owner_display_name_override: None,
-            owner_auth_tag: None,
-            kudos_bot_pubkey: None,
-        };
-
-        assert_eq!(event_channel_id(&event, &config), Some("second-channel"));
     }
 
     #[test]
