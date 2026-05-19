@@ -1,8 +1,8 @@
 # LexeBot
 
 A deterministic Sprout bot that runs locally, receives encrypted auto-kudos
-commands, and lets one configured owner control a Lexe wallet through encrypted
-Sprout direct messages.
+commands, and lets one configured owner control a Lexe wallet from a Sprout
+direct message.
 
 LexeBot is not AI-powered. It holds a Nostr bot key for Sprout messages and a
 Lexe SDK client credential string supplied locally by the user. It only accepts
@@ -11,9 +11,9 @@ the owner pubkey is derived from `SPROUT_OWNER_PRIVATE_KEY`.
 
 ## Commands
 
-Manual wallet commands must be sent by the configured owner as encrypted Sprout
-direct messages to LexeBot. Plain channel messages are ignored for wallet
-commands, including messages in the LexeBot DM channel.
+Manual wallet commands must be sent by the configured owner in the LexeBot
+Sprout DM. Plain wallet commands in other configured channels are ignored, even
+if they mention LexeBot.
 
 ```text
 get balance
@@ -25,7 +25,13 @@ send ₿500 to <payment-target>
 `get BOLT12` creates and returns a reusable Lexe BOLT12 offer with no minimum
 amount.
 
-Command replies are sent back as encrypted Sprout direct messages.
+Command replies are sent back in the same LexeBot Sprout DM.
+
+Privacy note: current Sprout DMs are scoped to the DM participants in the
+Sprout UI and relay access controls, but the message content is plaintext
+`kind:9` content on the relay. The relay operator can read these manual
+commands and replies. Encrypted auto-kudos machine commands use a separate
+NIP-44 path and remain encrypted.
 
 `<payment-target>` is passed to Lexe's generic payment parser. Use whatever the
 installed Lexe Rust SDK accepts, such as a BOLT11 invoice, BOLT12 offer, Human
@@ -40,13 +46,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.13-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.13/lexebot-v0.1.13-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.13-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.13/lexebot-v0.1.13-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.13-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.14-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.14/lexebot-v0.1.14-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.14-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.14/lexebot-v0.1.14-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.14-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.13-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.14-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
