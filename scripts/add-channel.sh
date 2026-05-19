@@ -93,7 +93,9 @@ Usage:
 Adds the already-installed LexeBot identity to another Sprout channel when
 needed, then updates ~/.config/lexebot/lexebot.env so run-lexebot listens there
 too. For DMs, the bot is already a participant, so a failed add-member attempt
-is tolerated and the config is still updated.
+is tolerated and the config is still updated. If Sprout CLI is not available,
+the config is still updated; this is sufficient for a DM that already includes
+LexeBot.
 EOF
 }
 
@@ -201,10 +203,14 @@ main() {
 
   load_config
   local sprout_cli
-  sprout_cli="$(find_sprout_cli)" || fail "Sprout CLI not found"
-  if ! sprout_add_bot_to_channel "$sprout_cli" "$channel_id"; then
-    say "Could not add LexeBot as a normal channel member."
-    say "Continuing because this is expected for a DM where LexeBot is already a participant."
+  if sprout_cli="$(find_sprout_cli)"; then
+    if ! sprout_add_bot_to_channel "$sprout_cli" "$channel_id"; then
+      say "Could not add LexeBot as a normal channel member."
+      say "Continuing because this is expected for a DM where LexeBot is already a participant."
+    fi
+  else
+    say "Sprout CLI not found; skipping channel member add."
+    say "This is OK for a DM where LexeBot is already a participant."
   fi
   update_channel_config "$channel_id"
   say "Done. Restart LexeBot so it subscribes to the new channel:"

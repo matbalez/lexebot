@@ -105,7 +105,8 @@ Manual-add mode installs LexeBot, writes local config with no channel
 subscriptions, prints the LexeBot pubkey, and exits without starting LexeBot.
 Auto-kudos can run channel-free. For manual wallet commands, open a DM with the
 printed LexeBot pubkey in Sprout, then configure that DM channel with
-`lexebot-add-channel <channel-uuid>`.
+`lexebot-add-channel <channel-uuid>`. For a DM, `lexebot-add-channel` only
+needs the channel UUID and does not require Sprout CLI to be installed.
 
 After the first install, start LexeBot from any directory with:
 
@@ -127,8 +128,10 @@ lexebot-add-channel <channel-uuid>
 
 Then restart LexeBot with `run-lexebot`. The helper adds the bot pubkey to the
 channel as role `bot` and appends the channel UUID to
-`~/.config/lexebot/lexebot.env`. Prefer using this for the LexeBot DM/control
-channel, not for every work channel where Kudos may be used.
+`~/.config/lexebot/lexebot.env` when Sprout CLI is available. If Sprout CLI is
+not available, the helper still appends the channel UUID; that is sufficient for
+a DM where LexeBot is already a participant. Prefer using this for the LexeBot
+DM/control channel, not for every work channel where Kudos may be used.
 
 Until Sprout exposes a copy button for channel UUIDs in the UI, use the
 installed helper to list channels and copy the target `id`/UUID:
