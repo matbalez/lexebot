@@ -18,12 +18,20 @@ if they mention LexeBot.
 ```text
 get balance
 get BOLT12
+fund wallet
+get transactions
 create invoice for ₿1,000
 send ₿500 to <payment-target>
 ```
 
 `get BOLT12` creates and returns a reusable Lexe BOLT12 offer with no minimum
 amount.
+
+`fund wallet` returns a reusable no-minimum BOLT12 offer for funding the Lexe
+wallet.
+
+`get transactions` syncs the Lexe payment cache and returns the 5 most recent
+payments.
 
 Command replies are sent back in the same LexeBot Sprout DM.
 
@@ -46,13 +54,13 @@ LexeBot uses `lexe v0.1.10`, which requires Rust 1.90 or newer.
 For Apple Silicon Macs:
 
 ```bash
-curl -L -o lexebot-v0.1.17-aarch64-apple-darwin.tar.gz \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.17/lexebot-v0.1.17-aarch64-apple-darwin.tar.gz
-curl -L -o lexebot-v0.1.17-aarch64-apple-darwin.tar.gz.sha256 \
-  https://github.com/matbalez/lexebot/releases/download/v0.1.17/lexebot-v0.1.17-aarch64-apple-darwin.tar.gz.sha256
-shasum -a 256 -c lexebot-v0.1.17-aarch64-apple-darwin.tar.gz.sha256
+curl -L -o lexebot-v0.1.18-aarch64-apple-darwin.tar.gz \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.18/lexebot-v0.1.18-aarch64-apple-darwin.tar.gz
+curl -L -o lexebot-v0.1.18-aarch64-apple-darwin.tar.gz.sha256 \
+  https://github.com/matbalez/lexebot/releases/download/v0.1.18/lexebot-v0.1.18-aarch64-apple-darwin.tar.gz.sha256
+shasum -a 256 -c lexebot-v0.1.18-aarch64-apple-darwin.tar.gz.sha256
 mkdir -p ~/.local/bin
-tar -xzf lexebot-v0.1.17-aarch64-apple-darwin.tar.gz
+tar -xzf lexebot-v0.1.18-aarch64-apple-darwin.tar.gz
 mv lexebot ~/.local/bin/lexebot
 chmod 700 ~/.local/bin/lexebot
 ```
@@ -80,7 +88,9 @@ reads the Lexe SDK client credentials from `LEXE_CLIENT_CREDENTIALS`, stores the
 `~/.local/bin/lexebot-list-channels`, opens a LexeBot DM, and configures that DM
 channel using the invoking user's Sprout identity. It then asks LexeBot to send
 a one-time welcome message to the DM using owner-attested auth, with the
-installed version and supported commands. On a fresh install, it prints
+installed version and supported commands. If the wallet balance is below
+₿2,500, it also sends a funding prompt with a reusable BOLT12 offer. On a fresh
+install, it prints
 the command to start LexeBot later, then runs LexeBot in the foreground in the
 current terminal so startup logs are visible. On rerun, it detects an existing
 local install and asks whether to start that existing bot instead of generating

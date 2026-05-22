@@ -14,6 +14,7 @@ use lexe::{
         auth::{ClientCredentials, CredentialsRef},
         bitcoin::Amount,
         command::{CreateInvoiceRequest, CreateOfferRequest, PayRequest},
+        payment::{Order, Payment, PaymentFilter},
     },
     wallet::LexeWallet,
 };
@@ -48,6 +49,7 @@ const BOT_ICON_DATA_URL: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const AUTO_KUDOS_PAYMENT_TIMEOUT: Duration = Duration::from_secs(25);
+const LEXE_MIN_FUNDED_BALANCE: u64 = 2_500;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,7 +63,8 @@ async fn main() -> Result<()> {
     }
     if let Some(channel_id) = one_shot_arg("--send-install-welcome")? {
         let config = Config::from_env()?;
-        send_install_welcome_once(&config, &channel_id).await?;
+        let lexe = LexeClient::from_env()?;
+        send_install_welcome_once(&config, &lexe, &channel_id).await?;
         return Ok(());
     }
 
@@ -116,6 +119,8 @@ impl LexeClient {
         match command {
             BotCommand::GetBalance => self.get_balance().await.map(Some),
             BotCommand::GetBolt12 => self.get_bolt12().await.map(Some),
+            BotCommand::FundWallet => self.fund_wallet().await.map(Some),
+            BotCommand::GetTransactions => self.get_transactions().await.map(Some),
             BotCommand::CreateInvoice { amount } => self.create_invoice(amount).await.map(Some),
             BotCommand::Send { amount, payable } => self
                 .send_payment(
@@ -155,6 +160,34 @@ impl LexeClient {
         ))
     }
 
+    async fn get_transactions(&self) -> Result<String> {
+        self.wallet
+            .sync_payments()
+            .await
+            .context("failed to sync Lexe payment history")?;
+        let response = self
+            .wallet
+            .list_payments(&PaymentFilter::All, Some(Order::Desc), Some(5), None)
+            .context("failed to list Lexe payment history")?;
+
+        Ok(format_recent_lexe_payments(&response.payments))
+    }
+
+    async fn funding_prompt_if_needed(&self) -> Result<Option<String>> {
+        let info = self.wallet.node_info().await?;
+        let balance = info.balance.sats_u64();
+        if balance >= LEXE_MIN_FUNDED_BALANCE {
+            return Ok(None);
+        }
+
+        Ok(Some(format!(
+            "Your Lexe wallet balance is {}, below the {} minimum needed for small sends. Fund it with this reusable BOLT12 offer:\n{}",
+            format_amount(balance),
+            format_amount(LEXE_MIN_FUNDED_BALANCE),
+            self.create_bolt12_offer().await?
+        )))
+    }
+
     async fn create_invoice(&self, amount: u64) -> Result<String> {
         let amount = amount_from_base_units(amount)?;
         let response = self
@@ -173,6 +206,13 @@ impl LexeClient {
             "Invoice for {}:\n{}",
             format_amount(amount.sats_u64()),
             response.invoice
+        ))
+    }
+
+    async fn fund_wallet(&self) -> Result<String> {
+        Ok(format!(
+            "Fund your Lexe wallet with this reusable BOLT12 offer:\n{}",
+            self.create_bolt12_offer().await?
         ))
     }
 
@@ -809,19 +849,33 @@ async fn send_auto_kudos_result(
     send_json(ws, json!(["EVENT", event])).await
 }
 
-async fn send_install_welcome_once(config: &Config, channel_id: &str) -> Result<()> {
+async fn send_install_welcome_once(
+    config: &Config,
+    lexe: &LexeClient,
+    channel_id: &str,
+) -> Result<()> {
     let mut ws = connect_and_authenticate(config).await?;
-    let event = build_message(
-        channel_id,
-        &install_welcome_message(),
-        &[config.owner_pubkey.to_hex()],
-    )?
-    .sign_with_keys(&config.bot_keys)?;
+    send_install_dm_message(&mut ws, config, channel_id, &install_welcome_message()).await?;
+
+    if let Some(message) = lexe.funding_prompt_if_needed().await? {
+        send_install_dm_message(&mut ws, config, channel_id, &message).await?;
+    }
+
+    Ok(())
+}
+
+async fn send_install_dm_message(
+    ws: &mut Ws,
+    config: &Config,
+    channel_id: &str,
+    content: &str,
+) -> Result<()> {
+    let event = build_message(channel_id, content, &[config.owner_pubkey.to_hex()])?
+        .sign_with_keys(&config.bot_keys)?;
     let event_id = event.id.to_hex();
 
-    send_json(&mut ws, json!(["EVENT", event])).await?;
-    wait_for_ok(&mut ws, &event_id).await?;
-    Ok(())
+    send_json(ws, json!(["EVENT", event])).await?;
+    wait_for_ok(ws, &event_id).await
 }
 
 fn install_welcome_message() -> String {
@@ -830,6 +884,8 @@ fn install_welcome_message() -> String {
 Supported commands:\n\
 get balance\n\
 get BOLT12\n\
+fund wallet\n\
+get transactions\n\
 create invoice for ₿1,000\n\
 send ₿500 to <payment-target>",
         env!("CARGO_PKG_VERSION")
@@ -971,6 +1027,8 @@ fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result
 enum BotCommand {
     GetBalance,
     GetBolt12,
+    FundWallet,
+    GetTransactions,
     CreateInvoice {
         amount: u64,
     },
@@ -1008,6 +1066,7 @@ fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
 
     match command.to_ascii_lowercase().as_str() {
         "get" => parse_get_command(rest),
+        "fund" => parse_fund_command(rest),
         "create" => parse_create_command(rest),
         "send" => parse_send_command(rest),
         "auto-kudos" => parse_auto_kudos_command(rest),
@@ -1015,11 +1074,19 @@ fn parse_command(content: &str) -> std::result::Result<BotCommand, String> {
     }
 }
 
+fn parse_fund_command(tokens: &[&str]) -> std::result::Result<BotCommand, String> {
+    match tokens {
+        ["wallet"] => Ok(BotCommand::FundWallet),
+        _ => Err("expected `fund wallet`".to_string()),
+    }
+}
+
 fn parse_get_command(tokens: &[&str]) -> std::result::Result<BotCommand, String> {
     match tokens {
         ["balance"] => Ok(BotCommand::GetBalance),
         [offer] if offer.eq_ignore_ascii_case("bolt12") => Ok(BotCommand::GetBolt12),
-        _ => Err("expected `get balance` or `get BOLT12`".to_string()),
+        ["transactions"] => Ok(BotCommand::GetTransactions),
+        _ => Err("expected `get balance`, `get BOLT12`, or `get transactions`".to_string()),
     }
 }
 
@@ -1064,7 +1131,7 @@ fn parse_auto_kudos_command(tokens: &[&str]) -> std::result::Result<BotCommand, 
 }
 
 fn command_help() -> String {
-    "use `get balance`, `get BOLT12`, `create invoice for ₿1,000`, or `send ₿500 to <payment-target>`; explicit mentions like `@LexeBot get balance` work too".to_string()
+    "use `get balance`, `get BOLT12`, `fund wallet`, `get transactions`, `create invoice for ₿1,000`, or `send ₿500 to <payment-target>`; explicit mentions like `@LexeBot get balance` work too".to_string()
 }
 
 fn parse_amount_token(token: &str) -> std::result::Result<u64, String> {
@@ -1098,6 +1165,40 @@ fn format_amount(amount: u64) -> String {
         out.push(ch);
     }
     out
+}
+
+fn format_recent_lexe_payments(payments: &[Payment]) -> String {
+    if payments.is_empty() {
+        return "No recent transactions found.".to_string();
+    }
+
+    let mut lines = Vec::with_capacity(payments.len() + 1);
+    lines.push("Recent transactions:".to_string());
+    for (index, payment) in payments.iter().enumerate() {
+        lines.push(format!("{}. {}", index + 1, format_lexe_payment(payment)));
+    }
+    lines.join("\n")
+}
+
+fn format_lexe_payment(payment: &Payment) -> String {
+    let amount = payment
+        .amount
+        .map(|amount| format_amount(amount.sats_u64()))
+        .unwrap_or_else(|| "amountless".to_string());
+    let fee = payment.fees.sats_u64();
+    let mut parts = vec![
+        payment.direction.to_string(),
+        payment.status.to_string(),
+        payment.kind.to_string(),
+        amount,
+    ];
+    if fee > 0 {
+        parts.push(format!("fee {}", format_amount(fee)));
+    }
+    if !payment.status_msg.trim().is_empty() {
+        parts.push(payment.status_msg.trim().to_string());
+    }
+    parts.join(" - ")
 }
 
 fn is_bot_mention_token(token: &str) -> bool {
@@ -1507,6 +1608,27 @@ mod tests {
         assert_eq!(
             parse_command("@lexebot get bolt12"),
             Ok(BotCommand::GetBolt12)
+        );
+    }
+
+    #[test]
+    fn parses_transactions_command() {
+        assert_eq!(
+            parse_command("get transactions"),
+            Ok(BotCommand::GetTransactions)
+        );
+        assert_eq!(
+            parse_command("@LexeBot get transactions"),
+            Ok(BotCommand::GetTransactions)
+        );
+    }
+
+    #[test]
+    fn parses_fund_wallet_command() {
+        assert_eq!(parse_command("fund wallet"), Ok(BotCommand::FundWallet));
+        assert_eq!(
+            parse_command("@LexeBot fund wallet"),
+            Ok(BotCommand::FundWallet)
         );
     }
 
