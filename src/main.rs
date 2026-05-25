@@ -28,6 +28,7 @@ use nostr::{
     ToBech32, Url, SECP256K1,
 };
 use serde_json::{json, Value};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::Url as WsUrl;
 
@@ -1187,6 +1188,7 @@ fn format_lexe_payment(payment: &Payment) -> String {
         .unwrap_or_else(|| "amountless".to_string());
     let fee = payment.fees.sats_u64();
     let mut parts = vec![
+        format_lexe_payment_timestamp(payment),
         payment.direction.to_string(),
         payment.status.to_string(),
         payment.kind.to_string(),
@@ -1199,6 +1201,22 @@ fn format_lexe_payment(payment: &Payment) -> String {
         parts.push(payment.status_msg.trim().to_string());
     }
     parts.join(" - ")
+}
+
+fn format_lexe_payment_timestamp(payment: &Payment) -> String {
+    let timestamp = payment.finalized_at.unwrap_or(payment.created_at);
+    format_timestamp_ms(timestamp.to_millis())
+}
+
+fn format_timestamp_ms(ms_since_epoch: u64) -> String {
+    let Some(secs_since_epoch) = i64::try_from(ms_since_epoch / 1000).ok() else {
+        return format!("{ms_since_epoch}ms since Unix epoch");
+    };
+
+    OffsetDateTime::from_unix_timestamp(secs_since_epoch)
+        .ok()
+        .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+        .unwrap_or_else(|| format!("{ms_since_epoch}ms since Unix epoch"))
 }
 
 fn is_bot_mention_token(token: &str) -> bool {
@@ -2038,6 +2056,15 @@ mod tests {
             "LexeBot v0.1.17 is available. You are running v0.1.16.\n\
 Upgrade:\n\
 curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh | bash"
+        );
+    }
+
+    #[test]
+    fn formats_transaction_timestamps_as_utc_rfc3339() {
+        assert_eq!(format_timestamp_ms(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_timestamp_ms(1_700_000_000_999),
+            "2023-11-14T22:13:20Z"
         );
     }
 
