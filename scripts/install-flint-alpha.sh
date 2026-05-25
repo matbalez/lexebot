@@ -802,11 +802,16 @@ send_install_welcome_message() {
   }
 
   say "Sending LexeBot welcome message..."
-  if ! SPROUT_RELAY_URL="$RELAY_WS_URL" \
-    SPROUT_BOT_PRIVATE_KEY="$bot_nsec" \
-    SPROUT_OWNER_PRIVATE_KEY="$owner_key" \
-    SPROUT_BOT_AUTH_MODE="owner-attested" \
-    "$LEXEBOT_BIN" --send-install-welcome "$channel_id" >/dev/null
+  if ! (
+    set -a
+    . "$CONFIG_FILE"
+    set +a
+    SPROUT_RELAY_URL="$RELAY_WS_URL" \
+      SPROUT_BOT_PRIVATE_KEY="$bot_nsec" \
+      SPROUT_OWNER_PRIVATE_KEY="$owner_key" \
+      SPROUT_BOT_AUTH_MODE="owner-attested" \
+      "$LEXEBOT_BIN" --send-install-welcome "$channel_id" >/dev/null
+  )
   then
     say "Warning: install completed, but the welcome message could not be sent."
   fi
