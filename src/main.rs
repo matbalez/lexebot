@@ -27,6 +27,7 @@ use nostr::{
     Alphabet, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, SingleLetterTag, Tag,
     ToBech32, Url, SECP256K1,
 };
+use qrcode::{render::unicode, EcLevel, QrCode};
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -181,11 +182,14 @@ impl LexeClient {
             return Ok(None);
         }
 
-        Ok(Some(format!(
-            "Your Lexe wallet balance is {}, below the {} minimum needed for small sends. Fund it with this reusable BOLT12 offer:\n{}",
+        let offer = self.create_bolt12_offer().await?;
+        Ok(Some(format_bolt12_offer_message(
+            &format!(
+                "Your Lexe wallet balance is {}, below the {} minimum needed for small sends. Fund it with this reusable BOLT12 offer.",
             format_amount(balance),
             format_amount(LEXE_MIN_FUNDED_BALANCE),
-            self.create_bolt12_offer().await?
+            ),
+            &offer,
         )))
     }
 
@@ -211,17 +215,16 @@ impl LexeClient {
     }
 
     async fn fund_wallet(&self) -> Result<String> {
-        Ok(format!(
-            "Fund your Lexe wallet with this reusable BOLT12 offer:\n{}",
-            self.create_bolt12_offer().await?
+        let offer = self.create_bolt12_offer().await?;
+        Ok(format_bolt12_offer_message(
+            "Fund your Lexe wallet with this reusable BOLT12 offer.",
+            &offer,
         ))
     }
 
     async fn get_bolt12(&self) -> Result<String> {
-        Ok(format!(
-            "BOLT12 offer:\n{}",
-            self.create_bolt12_offer().await?
-        ))
+        let offer = self.create_bolt12_offer().await?;
+        Ok(format_bolt12_offer_message("BOLT12 offer.", &offer))
     }
 
     async fn create_bolt12_offer(&self) -> Result<String> {
@@ -1155,6 +1158,25 @@ fn amount_from_base_units(amount: u64) -> Result<Amount> {
     Amount::try_from_sats_u64(amount).context("amount is outside Lexe's supported range")
 }
 
+fn format_bolt12_offer_message(intro: &str, offer: &str) -> String {
+    let mut message = format!("{intro}\n\nScan this QR code:\n\n```text\n");
+    message.push_str(&format_qr_code(offer));
+    message.push_str("\n```\n\nBOLT12 offer:\n");
+    message.push_str(offer);
+    message
+}
+
+fn format_qr_code(value: &str) -> String {
+    QrCode::with_error_correction_level(value.as_bytes(), EcLevel::M)
+        .map(|code| {
+            code.render::<unicode::Dense1x2>()
+                .quiet_zone(true)
+                .module_dimensions(2, 1)
+                .build()
+        })
+        .unwrap_or_else(|_| "QR code unavailable; use the BOLT12 offer text below.".to_string())
+}
+
 fn format_amount(amount: u64) -> String {
     let digits = amount.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
@@ -2057,6 +2079,14 @@ mod tests {
 Upgrade:\n\
 curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/install.sh | bash"
         );
+    }
+
+    #[test]
+    fn formats_bolt12_offer_message_with_qr_and_raw_offer() {
+        let message = format_bolt12_offer_message("BOLT12 offer.", "lno1qtest");
+        assert!(message.starts_with("BOLT12 offer.\n\nScan this QR code:"));
+        assert!(message.contains("```text\n"));
+        assert!(message.contains("BOLT12 offer:\nlno1qtest"));
     }
 
     #[test]
