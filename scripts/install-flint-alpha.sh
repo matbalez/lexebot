@@ -593,8 +593,8 @@ download_lexebot() {
   LEXEBOT_DOWNLOAD_TMPDIR="$tmpdir"
 
   say "Downloading LexeBot ${LEXEBOT_VERSION}..."
-  curl -fL -o "${tmpdir}/${LEXEBOT_ARCHIVE}" "${LEXEBOT_RELEASE_BASE}/${LEXEBOT_ARCHIVE}"
-  curl -fL -o "${tmpdir}/${LEXEBOT_ARCHIVE}.sha256" "${LEXEBOT_RELEASE_BASE}/${LEXEBOT_ARCHIVE}.sha256"
+  curl -fL -H "Cache-Control: no-cache" -o "${tmpdir}/${LEXEBOT_ARCHIVE}" "${LEXEBOT_RELEASE_BASE}/${LEXEBOT_ARCHIVE}"
+  curl -fL -H "Cache-Control: no-cache" -o "${tmpdir}/${LEXEBOT_ARCHIVE}.sha256" "${LEXEBOT_RELEASE_BASE}/${LEXEBOT_ARCHIVE}.sha256"
 
   (
     cd "$tmpdir"
