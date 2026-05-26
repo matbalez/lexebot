@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "lexebot"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

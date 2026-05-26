@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use image::{ImageFormat, Luma};
@@ -876,7 +876,20 @@ async fn prepare_dm_message(config: &Config, content: &str) -> (String, Vec<Tag>
         ),
         Err(err) => {
             eprintln!("could not upload BOLT12 QR image: {err:#}");
-            (content.to_string(), Vec::new())
+            match render_bolt12_qr_data_url(offer) {
+                Ok(data_url) if content.len() + data_url.len() < 64 * 1024 => (
+                    format_bolt12_offer_message_with_image(content, &data_url),
+                    Vec::new(),
+                ),
+                Ok(_) => {
+                    eprintln!("BOLT12 QR data URL fallback is too large for a DM event");
+                    (content.to_string(), Vec::new())
+                }
+                Err(err) => {
+                    eprintln!("could not render BOLT12 QR data URL fallback: {err:#}");
+                    (content.to_string(), Vec::new())
+                }
+            }
         }
     }
 }
@@ -896,12 +909,20 @@ async fn upload_bolt12_qr(config: &Config, offer: &str) -> Result<UploadedQrImag
     );
     let upload_url = format!("{}/media/upload", relay_http_url(&config.relay_url)?);
 
-    let response = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .put(upload_url)
         .header("Authorization", auth_header)
         .header("Content-Type", "image/png")
         .header("X-SHA-256", &sha256)
-        .body(png)
+        .body(png);
+    if let Some(auth_tag) = config.owner_auth_tag.as_ref().map(auth_tag_json) {
+        request = request.header("x-auth-tag", auth_tag.to_string());
+    }
+    if let Some(token) = optional_upload_auth_token() {
+        request = request.header("x-auth-token", token);
+    }
+
+    let response = request
         .send()
         .await
         .context("failed to upload BOLT12 QR image")?;
@@ -944,6 +965,21 @@ async fn upload_bolt12_qr(config: &Config, offer: &str) -> Result<UploadedQrImag
     })
 }
 
+fn optional_upload_auth_token() -> Option<String> {
+    [
+        "LEXEBOT_SPROUT_AUTH_TOKEN",
+        "SPROUT_AUTH_TOKEN",
+        "SPROUT_API_TOKEN",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| value.starts_with("sprout_"))
+    })
+}
+
 fn render_bolt12_qr_png(offer: &str) -> Result<Vec<u8>> {
     let code = QrCode::with_error_correction_level(offer.as_bytes(), EcLevel::M)
         .context("failed to render BOLT12 QR code")?;
@@ -960,6 +996,13 @@ fn render_bolt12_qr_png(offer: &str) -> Result<Vec<u8>> {
         .write_to(&mut cursor, ImageFormat::Png)
         .context("failed to encode BOLT12 QR PNG")?;
     Ok(cursor.into_inner())
+}
+
+fn render_bolt12_qr_data_url(offer: &str) -> Result<String> {
+    Ok(format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(render_bolt12_qr_png(offer)?)
+    ))
 }
 
 fn build_media_upload_auth(config: &Config, sha256: &str) -> Result<Event> {
@@ -2722,6 +2765,13 @@ curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/insta
     fn renders_bolt12_qr_png() {
         let png = render_bolt12_qr_png("lno1qtest").unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn renders_bolt12_qr_data_url() {
+        let data_url = render_bolt12_qr_data_url("lno1qtest").unwrap();
+        assert!(data_url.starts_with("data:image/png;base64,"));
+        assert!(data_url.len() < 64 * 1024);
     }
 
     #[test]
