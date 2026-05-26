@@ -1,9 +1,11 @@
 //! A deterministic Sprout bot for controlling one owner's Lexe wallet.
 
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,7 +16,7 @@ use lexe::{
         auth::{ClientCredentials, CredentialsRef},
         bitcoin::Amount,
         command::{CreateInvoiceRequest, CreateOfferRequest, PayRequest},
-        payment::{Order, Payment, PaymentFilter},
+        payment::{Order, Payment, PaymentDirection, PaymentFilter, PaymentStatus},
     },
     wallet::LexeWallet,
 };
@@ -42,8 +44,11 @@ const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
 const PRESENCE_UPDATE_KIND: u16 = 20_001;
 const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const INBOUND_PAYMENT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 const LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/matbalez/lexebot/releases/latest";
+const AUTO_KUDOS_SOURCE_DEDUP_MAX_LEN: usize = 1_024;
+const INBOUND_PAYMENT_DEDUP_MAX_LEN: usize = 1_024;
 const BOT_NAME: &str = "lexebot";
 const BOT_DISPLAY_NAME: &str = "LexeBot";
 const BOT_ABOUT: &str = "A deterministic Sprout bot that lets one owner control a Lexe wallet.";
@@ -72,7 +77,14 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let lexe = LexeClient::from_env()?;
-    let runtime = Runtime { config, lexe };
+    let runtime = Runtime {
+        config,
+        lexe,
+        processed_auto_kudos_sources: Mutex::new(RecentEventIds::new(
+            AUTO_KUDOS_SOURCE_DEDUP_MAX_LEN,
+        )),
+        seen_inbound_payments: Mutex::new(RecentEventIds::new(INBOUND_PAYMENT_DEDUP_MAX_LEN)),
+    };
 
     eprintln!(
         "lexebot pubkey: {}",
@@ -89,6 +101,8 @@ async fn main() -> Result<()> {
 struct Runtime {
     config: Config,
     lexe: LexeClient,
+    processed_auto_kudos_sources: Mutex<RecentEventIds>,
+    seen_inbound_payments: Mutex<RecentEventIds>,
 }
 
 struct LexeClient {
@@ -163,16 +177,20 @@ impl LexeClient {
     }
 
     async fn get_transactions(&self) -> Result<String> {
+        Ok(format_recent_lexe_payments(&self.recent_payments(5).await?))
+    }
+
+    async fn recent_payments(&self, limit: usize) -> Result<Vec<Payment>> {
         self.wallet
             .sync_payments()
             .await
             .context("failed to sync Lexe payment history")?;
         let response = self
             .wallet
-            .list_payments(&PaymentFilter::All, Some(Order::Desc), Some(5), None)
+            .list_payments(&PaymentFilter::All, Some(Order::Desc), Some(limit), None)
             .context("failed to list Lexe payment history")?;
 
-        Ok(format_recent_lexe_payments(&response.payments))
+        Ok(response.payments)
     }
 
     async fn funding_prompt_if_needed(&self) -> Result<Option<String>> {
@@ -331,6 +349,9 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let mut update_check_interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
     update_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     update_check_interval.tick().await;
+    let mut inbound_payment_check_interval = tokio::time::interval(INBOUND_PAYMENT_CHECK_INTERVAL);
+    inbound_payment_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    inbound_payment_check_interval.tick().await;
 
     eprintln!("listening for owner DM commands and encrypted auto-kudos commands");
     if runtime.config.channel_ids.len() > 1 {
@@ -341,6 +362,9 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     }
     if let Err(err) = maybe_notify_update_available(&mut ws, &runtime.config).await {
         eprintln!("update check failed: {err:#}");
+    }
+    if let Err(err) = remember_recent_inbound_payments(runtime).await {
+        eprintln!("incoming payment notification initialization failed: {err:#}");
     }
 
     loop {
@@ -356,6 +380,11 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
             _ = update_check_interval.tick() => {
                 if let Err(err) = maybe_notify_update_available(&mut ws, &runtime.config).await {
                     eprintln!("update check failed: {err:#}");
+                }
+            }
+            _ = inbound_payment_check_interval.tick() => {
+                if let Err(err) = notify_new_inbound_payments(&mut ws, runtime).await {
+                    eprintln!("incoming payment notification check failed: {err:#}");
                 }
             }
             next = ws.next() => {
@@ -666,9 +695,23 @@ async fn handle_encrypted_auto_kudos(ws: &mut Ws, runtime: &Runtime, event: &Eve
         }
     };
     let receipt = auto_kudos_receipt(&command);
+    let source_event_id = auto_kudos_source_event_id(&command).map(str::to_string);
+
+    if let Some(source_event_id) = source_event_id.as_deref() {
+        if auto_kudos_source_processed(runtime, source_event_id)? {
+            send_auto_kudos_result(ws, &runtime.config, event, true).await?;
+            eprintln!(
+                "ignored duplicate encrypted auto-kudos command {command_event_id} for source {source_event_id}"
+            );
+            return Ok(());
+        }
+    }
 
     match tokio::time::timeout(AUTO_KUDOS_PAYMENT_TIMEOUT, runtime.lexe.execute(command)).await {
         Ok(Ok(_)) => {
+            if let Some(source_event_id) = source_event_id.as_deref() {
+                remember_auto_kudos_source(runtime, &command_event_id, source_event_id)?;
+            }
             if let Some(receipt) = receipt {
                 if let Err(err) = send_owner_dm_message(ws, &runtime.config, &receipt).await {
                     eprintln!("could not send auto-kudos owner DM receipt: {err:#}");
@@ -693,6 +736,66 @@ async fn handle_encrypted_auto_kudos(ws: &mut Ws, runtime: &Runtime, event: &Eve
     Ok(())
 }
 
+fn auto_kudos_source_processed(runtime: &Runtime, source_event_id: &str) -> Result<bool> {
+    let processed = runtime
+        .processed_auto_kudos_sources
+        .lock()
+        .map_err(|_| anyhow!("auto-kudos dedup state lock poisoned"))?;
+    Ok(processed.contains(source_event_id))
+}
+
+fn remember_auto_kudos_source(
+    runtime: &Runtime,
+    command_event_id: &str,
+    source_event_id: &str,
+) -> Result<()> {
+    let mut processed = runtime
+        .processed_auto_kudos_sources
+        .lock()
+        .map_err(|_| anyhow!("auto-kudos dedup state lock poisoned"))?;
+    processed.insert_new(source_event_id);
+    eprintln!("remembered auto-kudos source {source_event_id} from command {command_event_id}");
+    Ok(())
+}
+
+struct RecentEventIds {
+    max_len: usize,
+    order: VecDeque<String>,
+    ids: HashSet<String>,
+}
+
+impl RecentEventIds {
+    fn new(max_len: usize) -> Self {
+        Self {
+            max_len,
+            order: VecDeque::new(),
+            ids: HashSet::new(),
+        }
+    }
+
+    fn contains(&self, event_id: &str) -> bool {
+        self.ids.contains(event_id)
+    }
+
+    fn insert_new(&mut self, event_id: &str) -> bool {
+        if self.ids.contains(event_id) {
+            return false;
+        }
+
+        let event_id = event_id.to_string();
+        self.ids.insert(event_id.clone());
+        self.order.push_back(event_id);
+
+        while self.order.len() > self.max_len {
+            if let Some(oldest) = self.order.pop_front() {
+                self.ids.remove(&oldest);
+            }
+        }
+
+        true
+    }
+}
+
 async fn send_owner_dm_message(ws: &mut Ws, config: &Config, content: &str) -> Result<()> {
     let Some(channel_id) = owner_dm_channel_id(config) else {
         return Ok(());
@@ -700,6 +803,42 @@ async fn send_owner_dm_message(ws: &mut Ws, config: &Config, content: &str) -> R
     let event = build_message(channel_id, content, &[config.owner_pubkey.to_hex()])?
         .sign_with_keys(&config.bot_keys)?;
     send_json(ws, json!(["EVENT", event])).await
+}
+
+async fn remember_recent_inbound_payments(runtime: &Runtime) -> Result<()> {
+    let payments = runtime.lexe.recent_payments(20).await?;
+    for payment in payments
+        .iter()
+        .filter(|payment| should_notify_inbound_payment(payment))
+    {
+        remember_inbound_payment(runtime, payment)?;
+    }
+    Ok(())
+}
+
+async fn notify_new_inbound_payments(ws: &mut Ws, runtime: &Runtime) -> Result<()> {
+    let payments = runtime.lexe.recent_payments(20).await?;
+    for payment in payments
+        .iter()
+        .rev()
+        .filter(|payment| should_notify_inbound_payment(payment))
+    {
+        if remember_inbound_payment(runtime, payment)? {
+            if let Some(notice) = inbound_payment_notice(payment) {
+                send_owner_dm_message(ws, &runtime.config, &notice).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remember_inbound_payment(runtime: &Runtime, payment: &Payment) -> Result<bool> {
+    let payment_id = payment.index.to_string();
+    let mut seen = runtime
+        .seen_inbound_payments
+        .lock()
+        .map_err(|_| anyhow!("incoming payment dedup state lock poisoned"))?;
+    Ok(seen.insert_new(&payment_id))
 }
 
 async fn maybe_notify_update_available(ws: &mut Ws, config: &Config) -> Result<()> {
@@ -951,6 +1090,11 @@ fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCom
         .filter(|payable| !payable.trim().is_empty())
         .ok_or_else(|| anyhow!("auto-kudos command missing payable"))?
         .to_string();
+    let source_event_id = value
+        .get("source_event_id")
+        .and_then(Value::as_str)
+        .filter(|source_event_id| !source_event_id.trim().is_empty())
+        .map(str::to_string);
     let receiver_display_name = auto_kudos_receiver_label(
         value.get("receiver_display_name").and_then(Value::as_str),
         receiver,
@@ -962,7 +1106,18 @@ fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCom
         receiver_display_name,
         amount,
         payable,
+        source_event_id,
     })
+}
+
+fn auto_kudos_source_event_id(command: &BotCommand) -> Option<&str> {
+    let BotCommand::AutoKudosSend {
+        source_event_id, ..
+    } = command
+    else {
+        return None;
+    };
+    source_event_id.as_deref()
 }
 
 fn auto_kudos_receiver_label(value: Option<&str>, receiver: PublicKey) -> String {
@@ -1046,6 +1201,7 @@ enum BotCommand {
         receiver_display_name: String,
         amount: u64,
         payable: String,
+        source_event_id: Option<String>,
     },
 }
 
@@ -1126,6 +1282,7 @@ fn parse_auto_kudos_command(tokens: &[&str]) -> std::result::Result<BotCommand, 
             ),
             amount: parse_amount_token(amount)?,
             payable: (*payable).to_string(),
+            source_event_id: None,
         }),
         _ => Err(
             "expected `@LexeBot auto-kudos <sender-pubkey> <receiver-pubkey> ₿500 to <payment-target>`"
@@ -1228,6 +1385,37 @@ fn format_lexe_payment(payment: &Payment) -> String {
 fn format_lexe_payment_timestamp(payment: &Payment) -> String {
     let timestamp = payment.finalized_at.unwrap_or(payment.created_at);
     format_timestamp_ms(timestamp.to_millis())
+}
+
+fn should_notify_inbound_payment(payment: &Payment) -> bool {
+    payment.direction == PaymentDirection::Inbound
+        && payment.status == PaymentStatus::Completed
+        && payment.amount.is_some()
+}
+
+fn inbound_payment_notice(payment: &Payment) -> Option<String> {
+    let amount = payment.amount?;
+    let message = payment.message.as_deref().and_then(clean_payment_note);
+    let mut lines = vec![if message.as_deref() == Some("Kudos!") {
+        format!("Received {} kudos.", format_amount(amount.sats_u64()))
+    } else {
+        format!("Received {}.", format_amount(amount.sats_u64()))
+    }];
+    if let Some(payer_name) = payment.payer_name.as_deref().and_then(clean_payment_note) {
+        lines.push(format!("From: {payer_name}"));
+    }
+    if let Some(message) = message {
+        lines.push(format!("Message: {message}"));
+    }
+    Some(lines.join("\n"))
+}
+
+fn clean_payment_note(value: &str) -> Option<String> {
+    let cleaned = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned.chars().take(240).collect())
 }
 
 fn format_timestamp_ms(ms_since_epoch: u64) -> String {
@@ -1720,7 +1908,8 @@ mod tests {
                     receiver.to_hex().chars().take(8).collect::<String>()
                 ),
                 amount: 500,
-                payable: "lno1abc".to_string()
+                payable: "lno1abc".to_string(),
+                source_event_id: None,
             })
         );
     }
@@ -1928,6 +2117,7 @@ mod tests {
             receiver_display_name: "@Receiver".to_string(),
             amount: 1,
             payable: "lno1abc".to_string(),
+            source_event_id: None,
         };
         assert!(command_authorized(
             &command,
@@ -1991,6 +2181,9 @@ mod tests {
                 receiver_display_name: "@DK".to_string(),
                 amount: 21,
                 payable: "lno1abc".to_string(),
+                source_event_id: Some(
+                    "c87370826bf84cbf48bd8e5c50d485a5df251a8b76595cc60916783ab4f5a422".to_string()
+                ),
             }
         );
         assert!(command_authorized(&command, event.pubkey, &config));
@@ -2004,6 +2197,7 @@ mod tests {
             receiver_display_name: "@DK".to_string(),
             amount: 21,
             payable: "lno1abc".to_string(),
+            source_event_id: None,
         };
 
         assert_eq!(
@@ -2087,6 +2281,19 @@ curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/insta
         assert!(message.starts_with("BOLT12 offer.\n\nScan this QR code:"));
         assert!(message.contains("```text\n"));
         assert!(message.contains("BOLT12 offer:\nlno1qtest"));
+    }
+
+    #[test]
+    fn recent_event_ids_rejects_duplicates_and_bounds_memory() {
+        let mut ids = RecentEventIds::new(2);
+        assert!(ids.insert_new("a"));
+        assert!(!ids.insert_new("a"));
+        assert!(ids.contains("a"));
+        assert!(ids.insert_new("b"));
+        assert!(ids.insert_new("c"));
+        assert!(!ids.contains("a"));
+        assert!(ids.contains("b"));
+        assert!(ids.contains("c"));
     }
 
     #[test]
