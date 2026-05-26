@@ -2,6 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
@@ -9,7 +10,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
+use image::{ImageFormat, Luma};
 use lexe::{
     config::WalletEnvConfig,
     types::{
@@ -29,7 +33,7 @@ use nostr::{
     Alphabet, Event, EventBuilder, Filter, JsonUtil, Keys, Kind, PublicKey, SingleLetterTag, Tag,
     ToBech32, Url, SECP256K1,
 };
-use qrcode::{render::unicode, EcLevel, QrCode};
+use qrcode::{EcLevel, QrCode};
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -670,15 +674,8 @@ async fn handle_plaintext_owner_dm(ws: &mut Ws, runtime: &Runtime, event: &Event
         Err(err) => format!("Invalid LexeBot command: {err}"),
     };
 
-    let Some(channel_id) = owner_dm_channel_id(&runtime.config) else {
-        return Ok(());
-    };
-    let reply_event = build_message(channel_id, &reply, &[runtime.config.owner_pubkey.to_hex()])?
-        .sign_with_keys(&runtime.config.bot_keys)?;
-    let reply_event_id = reply_event.id.to_hex();
-
-    send_json(ws, json!(["EVENT", reply_event])).await?;
-    eprintln!("replied to plaintext owner DM {command_event_id} with {reply_event_id}");
+    send_owner_dm_message(ws, &runtime.config, &reply).await?;
+    eprintln!("replied to plaintext owner DM {command_event_id}");
     Ok(())
 }
 
@@ -840,9 +837,159 @@ async fn send_owner_dm_message(ws: &mut Ws, config: &Config, content: &str) -> R
     let Some(channel_id) = owner_dm_channel_id(config) else {
         return Ok(());
     };
-    let event = build_message(channel_id, content, &[config.owner_pubkey.to_hex()])?
-        .sign_with_keys(&config.bot_keys)?;
-    send_json(ws, json!(["EVENT", event])).await
+    send_dm_message(ws, config, channel_id, content, false).await
+}
+
+async fn send_dm_message(
+    ws: &mut Ws,
+    config: &Config,
+    channel_id: &str,
+    content: &str,
+    wait_for_ack: bool,
+) -> Result<()> {
+    let (content, media_tags) = prepare_dm_message(config, content).await;
+    let event = build_message_with_tags(
+        channel_id,
+        &content,
+        &[config.owner_pubkey.to_hex()],
+        media_tags,
+    )?
+    .sign_with_keys(&config.bot_keys)?;
+    let event_id = event.id.to_hex();
+
+    send_json(ws, json!(["EVENT", event])).await?;
+    if wait_for_ack {
+        wait_for_ok(ws, &event_id).await?;
+    }
+    Ok(())
+}
+
+async fn prepare_dm_message(config: &Config, content: &str) -> (String, Vec<Tag>) {
+    let Some(offer) = extract_bolt12_offer(content) else {
+        return (content.to_string(), Vec::new());
+    };
+
+    match upload_bolt12_qr(config, offer).await {
+        Ok(image) => (
+            format_bolt12_offer_message_with_image(content, &image.url),
+            image.tags,
+        ),
+        Err(err) => {
+            eprintln!("could not upload BOLT12 QR image: {err:#}");
+            (content.to_string(), Vec::new())
+        }
+    }
+}
+
+struct UploadedQrImage {
+    url: String,
+    tags: Vec<Tag>,
+}
+
+async fn upload_bolt12_qr(config: &Config, offer: &str) -> Result<UploadedQrImage> {
+    let png = render_bolt12_qr_png(offer)?;
+    let sha256 = Sha256Hash::hash(&png).to_string();
+    let auth = build_media_upload_auth(config, &sha256)?;
+    let auth_header = format!(
+        "Nostr {}",
+        URL_SAFE_NO_PAD.encode(auth.as_json().as_bytes())
+    );
+    let upload_url = format!("{}/media/upload", relay_http_url(&config.relay_url)?);
+
+    let response = reqwest::Client::new()
+        .put(upload_url)
+        .header("Authorization", auth_header)
+        .header("Content-Type", "image/png")
+        .header("X-SHA-256", &sha256)
+        .body(png)
+        .send()
+        .await
+        .context("failed to upload BOLT12 QR image")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("QR image upload rejected with {status}: {body}");
+    }
+
+    let descriptor: Value = response
+        .json()
+        .await
+        .context("QR image upload response was not JSON")?;
+    let url = descriptor
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| anyhow!("QR image upload response missing url"))?
+        .to_string();
+    let size = descriptor
+        .get("size")
+        .and_then(Value::as_u64)
+        .map(|size| size.to_string());
+
+    let mut imeta = vec![
+        "imeta".to_string(),
+        format!("url {url}"),
+        "m image/png".to_string(),
+        format!("x {sha256}"),
+        "dim 640x640".to_string(),
+    ];
+    if let Some(size) = size {
+        imeta.push(format!("size {size}"));
+    }
+
+    Ok(UploadedQrImage {
+        url,
+        tags: vec![Tag::parse(&imeta)?],
+    })
+}
+
+fn render_bolt12_qr_png(offer: &str) -> Result<Vec<u8>> {
+    let code = QrCode::with_error_correction_level(offer.as_bytes(), EcLevel::M)
+        .context("failed to render BOLT12 QR code")?;
+    let image = code
+        .render::<Luma<u8>>()
+        .quiet_zone(true)
+        .min_dimensions(640, 640)
+        .dark_color(Luma([0]))
+        .light_color(Luma([255]))
+        .build();
+
+    let mut cursor = Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, ImageFormat::Png)
+        .context("failed to encode BOLT12 QR PNG")?;
+    Ok(cursor.into_inner())
+}
+
+fn build_media_upload_auth(config: &Config, sha256: &str) -> Result<Event> {
+    let expiration = nostr::Timestamp::now().as_u64() + 300;
+    let tags = vec![
+        Tag::parse(&["t", "upload"])?,
+        Tag::parse(&["x", sha256])?,
+        Tag::parse(&["expiration", &expiration.to_string()])?,
+    ];
+    Ok(
+        EventBuilder::new(Kind::from(24242), "Upload BOLT12 QR", tags)
+            .sign_with_keys(&config.bot_keys)?,
+    )
+}
+
+fn relay_http_url(relay_url: &str) -> Result<String> {
+    let mut url = WsUrl::parse(relay_url).context("SPROUT_RELAY_URL is not a valid URL")?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        "http" => "http",
+        "https" => "https",
+        other => bail!("unsupported relay URL scheme for media upload: {other}"),
+    };
+    url.set_scheme(scheme)
+        .map_err(|_| anyhow!("failed to convert relay URL to HTTP URL"))?;
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
 async fn remember_recent_inbound_payments(runtime: &Runtime) -> Result<()> {
@@ -1154,12 +1301,7 @@ async fn send_install_dm_message(
     channel_id: &str,
     content: &str,
 ) -> Result<()> {
-    let event = build_message(channel_id, content, &[config.owner_pubkey.to_hex()])?
-        .sign_with_keys(&config.bot_keys)?;
-    let event_id = event.id.to_hex();
-
-    send_json(ws, json!(["EVENT", event])).await?;
-    wait_for_ok(ws, &event_id).await
+    send_dm_message(ws, config, channel_id, content, true).await
 }
 
 fn install_welcome_message() -> String {
@@ -1374,7 +1516,12 @@ fn auto_kudos_personal_note(receiver_display_name: &str) -> String {
     format!("You sent a Kudos to {name}")
 }
 
-fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result<EventBuilder> {
+fn build_message_with_tags(
+    channel_id: &str,
+    content: &str,
+    mentions: &[String],
+    mut extra_tags: Vec<Tag>,
+) -> Result<EventBuilder> {
     if content.len() > 64 * 1024 {
         bail!("message content exceeds 64 KiB");
     }
@@ -1383,6 +1530,7 @@ fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result
     for pubkey in mentions.iter().take(50) {
         tags.push(Tag::parse(&["p", pubkey])?);
     }
+    tags.append(&mut extra_tags);
     Ok(EventBuilder::new(Kind::Custom(9), content, tags))
 }
 
@@ -1526,22 +1674,27 @@ fn amount_from_base_units(amount: u64) -> Result<Amount> {
 }
 
 fn format_bolt12_offer_message(intro: &str, offer: &str) -> String {
-    let mut message = format!("{intro}\n\nScan this QR code:\n\n```text\n");
-    message.push_str(&format_qr_code(offer));
-    message.push_str("\n```\n\nBOLT12 offer:\n");
+    let mut message = format!("{intro}\n\nBOLT12 offer:\n");
     message.push_str(offer);
     message
 }
 
-fn format_qr_code(value: &str) -> String {
-    QrCode::with_error_correction_level(value.as_bytes(), EcLevel::M)
-        .map(|code| {
-            code.render::<unicode::Dense1x2>()
-                .quiet_zone(true)
-                .module_dimensions(2, 1)
-                .build()
-        })
-        .unwrap_or_else(|_| "QR code unavailable; use the BOLT12 offer text below.".to_string())
+fn extract_bolt12_offer(content: &str) -> Option<&str> {
+    content
+        .split_once("BOLT12 offer:\n")
+        .map(|(_, offer)| offer.trim())
+        .filter(|offer| offer.starts_with("lno1"))
+}
+
+fn format_bolt12_offer_message_with_image(content: &str, image_url: &str) -> String {
+    let Some(offer) = extract_bolt12_offer(content) else {
+        return content.to_string();
+    };
+    let intro = content
+        .split_once("\n\nBOLT12 offer:\n")
+        .map(|(intro, _)| intro)
+        .unwrap_or("BOLT12 offer.");
+    format!("{intro}\n\n![BOLT12 QR code]({image_url})\n\nBOLT12 offer:\n{offer}")
 }
 
 fn format_amount(amount: u64) -> String {
@@ -2548,11 +2701,27 @@ curl -fsSL https://raw.githubusercontent.com/matbalez/lexebot/main/scripts/insta
     }
 
     #[test]
-    fn formats_bolt12_offer_message_with_qr_and_raw_offer() {
+    fn formats_bolt12_offer_message_with_raw_offer() {
         let message = format_bolt12_offer_message("BOLT12 offer.", "lno1qtest");
-        assert!(message.starts_with("BOLT12 offer.\n\nScan this QR code:"));
-        assert!(message.contains("```text\n"));
-        assert!(message.contains("BOLT12 offer:\nlno1qtest"));
+        assert_eq!(message, "BOLT12 offer.\n\nBOLT12 offer:\nlno1qtest");
+    }
+
+    #[test]
+    fn formats_bolt12_offer_message_with_uploaded_image() {
+        let message = format_bolt12_offer_message_with_image(
+            "BOLT12 offer.\n\nBOLT12 offer:\nlno1qtest",
+            "https://example.test/qr.png",
+        );
+        assert_eq!(
+            message,
+            "BOLT12 offer.\n\n![BOLT12 QR code](https://example.test/qr.png)\n\nBOLT12 offer:\nlno1qtest"
+        );
+    }
+
+    #[test]
+    fn renders_bolt12_qr_png() {
+        let png = render_bolt12_qr_png("lno1qtest").unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 
     #[test]
