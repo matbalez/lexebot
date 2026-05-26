@@ -44,7 +44,8 @@ const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
 const PRESENCE_UPDATE_KIND: u16 = 20_001;
 const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
-const INBOUND_PAYMENT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+const AUTO_KUDOS_RECEIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const AUTO_KUDOS_RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/matbalez/lexebot/releases/latest";
 const AUTO_KUDOS_SOURCE_DEDUP_MAX_LEN: usize = 1_024;
@@ -84,6 +85,7 @@ async fn main() -> Result<()> {
             AUTO_KUDOS_SOURCE_DEDUP_MAX_LEN,
         )),
         seen_inbound_payments: Mutex::new(RecentEventIds::new(INBOUND_PAYMENT_DEDUP_MAX_LEN)),
+        pending_inbound_kudos: Mutex::new(Vec::new()),
     };
 
     eprintln!(
@@ -103,6 +105,7 @@ struct Runtime {
     lexe: LexeClient,
     processed_auto_kudos_sources: Mutex<RecentEventIds>,
     seen_inbound_payments: Mutex<RecentEventIds>,
+    pending_inbound_kudos: Mutex<Vec<PendingInboundKudos>>,
 }
 
 struct LexeClient {
@@ -349,9 +352,9 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
     let mut update_check_interval = tokio::time::interval(UPDATE_CHECK_INTERVAL);
     update_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     update_check_interval.tick().await;
-    let mut inbound_payment_check_interval = tokio::time::interval(INBOUND_PAYMENT_CHECK_INTERVAL);
-    inbound_payment_check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    inbound_payment_check_interval.tick().await;
+    let mut auto_kudos_receive_interval = tokio::time::interval(AUTO_KUDOS_RECEIVE_POLL_INTERVAL);
+    auto_kudos_receive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    auto_kudos_receive_interval.tick().await;
 
     eprintln!("listening for owner DM commands and encrypted auto-kudos commands");
     if runtime.config.channel_ids.len() > 1 {
@@ -382,9 +385,9 @@ async fn run_session(runtime: &Runtime) -> Result<()> {
                     eprintln!("update check failed: {err:#}");
                 }
             }
-            _ = inbound_payment_check_interval.tick() => {
-                if let Err(err) = notify_new_inbound_payments(&mut ws, runtime).await {
-                    eprintln!("incoming payment notification check failed: {err:#}");
+            _ = auto_kudos_receive_interval.tick() => {
+                if let Err(err) = check_pending_inbound_kudos(&mut ws, runtime).await {
+                    eprintln!("pending auto-kudos receive check failed: {err:#}");
                 }
             }
             next = ws.next() => {
@@ -640,7 +643,7 @@ async fn maybe_reply(
     }
     if event.kind == Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND) {
         if event_addresses_bot(event, &runtime.config) {
-            handle_encrypted_auto_kudos(ws, runtime, event).await?;
+            handle_encrypted_auto_kudos_message(ws, runtime, event).await?;
         }
         return Ok(());
     }
@@ -679,21 +682,43 @@ async fn handle_plaintext_owner_dm(ws: &mut Ws, runtime: &Runtime, event: &Event
     Ok(())
 }
 
-async fn handle_encrypted_auto_kudos(ws: &mut Ws, runtime: &Runtime, event: &Event) -> Result<()> {
+async fn handle_encrypted_auto_kudos_message(
+    ws: &mut Ws,
+    runtime: &Runtime,
+    event: &Event,
+) -> Result<()> {
     let command_event_id = event.id.to_hex();
-    let command = match encrypted_auto_kudos_command(&runtime.config, event) {
-        Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => command,
-        Ok(_) => {
+    let message = match encrypted_auto_kudos_message(&runtime.config, event) {
+        Ok(message) if auto_kudos_message_authorized(&message, event.pubkey, &runtime.config) => {
+            message
+        }
+        Ok(AutoKudosMessage::Send(_)) => {
             send_auto_kudos_result(ws, &runtime.config, event, false).await?;
             eprintln!("rejected unauthorized encrypted auto-kudos command {command_event_id}");
             return Ok(());
         }
+        Ok(AutoKudosMessage::ReceiveNotice(_)) => {
+            eprintln!(
+                "rejected unauthorized encrypted auto-kudos receive notice {command_event_id}"
+            );
+            return Ok(());
+        }
         Err(err) => {
             send_auto_kudos_result(ws, &runtime.config, event, false).await?;
-            eprintln!("invalid encrypted auto-kudos command {command_event_id}: {err:#}");
+            eprintln!("invalid encrypted auto-kudos message {command_event_id}: {err:#}");
             return Ok(());
         }
     };
+
+    let command = match message {
+        AutoKudosMessage::Send(command) => command,
+        AutoKudosMessage::ReceiveNotice(notice) => {
+            remember_pending_inbound_kudos(runtime, notice)?;
+            eprintln!("accepted encrypted auto-kudos receive notice {command_event_id}");
+            return Ok(());
+        }
+    };
+
     let receipt = auto_kudos_receipt(&command);
     let source_event_id = auto_kudos_source_event_id(&command).map(str::to_string);
 
@@ -796,6 +821,21 @@ impl RecentEventIds {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutoKudosReceiveNotice {
+    sender: PublicKey,
+    receiver: PublicKey,
+    sender_display_name: String,
+    amount: u64,
+    source_event_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingInboundKudos {
+    notice: AutoKudosReceiveNotice,
+    requested_at: Instant,
+}
+
 async fn send_owner_dm_message(ws: &mut Ws, config: &Config, content: &str) -> Result<()> {
     let Some(channel_id) = owner_dm_channel_id(config) else {
         return Ok(());
@@ -816,29 +856,130 @@ async fn remember_recent_inbound_payments(runtime: &Runtime) -> Result<()> {
     Ok(())
 }
 
-async fn notify_new_inbound_payments(ws: &mut Ws, runtime: &Runtime) -> Result<()> {
+async fn check_pending_inbound_kudos(ws: &mut Ws, runtime: &Runtime) -> Result<()> {
+    if !prune_and_has_pending_inbound_kudos(runtime)? {
+        return Ok(());
+    }
+
     let payments = runtime.lexe.recent_payments(20).await?;
+    let mut notices = Vec::new();
+
     for payment in payments
         .iter()
         .rev()
         .filter(|payment| should_notify_inbound_payment(payment))
     {
-        if remember_inbound_payment(runtime, payment)? {
-            if let Some(notice) = inbound_payment_notice(payment) {
-                send_owner_dm_message(ws, &runtime.config, &notice).await?;
+        let payment_id = payment.index.to_string();
+        if inbound_payment_seen(runtime, &payment_id)? {
+            continue;
+        }
+
+        if let Some(pending) = take_matching_pending_inbound_kudos(runtime, payment)? {
+            remember_inbound_payment_id(runtime, &payment_id)?;
+            if let Some(notice) = inbound_payment_notice(payment, &pending.notice) {
+                notices.push(notice);
             }
         }
     }
+
+    for notice in notices {
+        send_owner_dm_message(ws, &runtime.config, &notice).await?;
+    }
+
     Ok(())
 }
 
 fn remember_inbound_payment(runtime: &Runtime, payment: &Payment) -> Result<bool> {
-    let payment_id = payment.index.to_string();
+    remember_inbound_payment_id(runtime, &payment.index.to_string())
+}
+
+fn remember_inbound_payment_id(runtime: &Runtime, payment_id: &str) -> Result<bool> {
     let mut seen = runtime
         .seen_inbound_payments
         .lock()
         .map_err(|_| anyhow!("incoming payment dedup state lock poisoned"))?;
-    Ok(seen.insert_new(&payment_id))
+    Ok(seen.insert_new(payment_id))
+}
+
+fn inbound_payment_seen(runtime: &Runtime, payment_id: &str) -> Result<bool> {
+    let seen = runtime
+        .seen_inbound_payments
+        .lock()
+        .map_err(|_| anyhow!("incoming payment dedup state lock poisoned"))?;
+    Ok(seen.contains(payment_id))
+}
+
+fn remember_pending_inbound_kudos(runtime: &Runtime, notice: AutoKudosReceiveNotice) -> Result<()> {
+    let mut pending = runtime
+        .pending_inbound_kudos
+        .lock()
+        .map_err(|_| anyhow!("pending auto-kudos receive state lock poisoned"))?;
+
+    if let Some(source_event_id) = notice.source_event_id.as_deref() {
+        if pending
+            .iter()
+            .any(|pending| pending.notice.source_event_id.as_deref() == Some(source_event_id))
+        {
+            eprintln!("ignored duplicate pending auto-kudos receive notice for {source_event_id}");
+            return Ok(());
+        }
+    }
+
+    pending.push(PendingInboundKudos {
+        notice,
+        requested_at: Instant::now(),
+    });
+    Ok(())
+}
+
+fn prune_and_has_pending_inbound_kudos(runtime: &Runtime) -> Result<bool> {
+    let mut pending = runtime
+        .pending_inbound_kudos
+        .lock()
+        .map_err(|_| anyhow!("pending auto-kudos receive state lock poisoned"))?;
+    let now = Instant::now();
+    pending.retain(|pending| {
+        let keep = now.duration_since(pending.requested_at) <= AUTO_KUDOS_RECEIVE_TIMEOUT;
+        if !keep {
+            if let Some(source_event_id) = pending.notice.source_event_id.as_deref() {
+                eprintln!("timed out waiting for inbound auto-kudos payment {source_event_id}");
+            } else {
+                eprintln!("timed out waiting for inbound auto-kudos payment");
+            }
+        }
+        keep
+    });
+    Ok(!pending.is_empty())
+}
+
+fn take_matching_pending_inbound_kudos(
+    runtime: &Runtime,
+    payment: &Payment,
+) -> Result<Option<PendingInboundKudos>> {
+    let mut pending = runtime
+        .pending_inbound_kudos
+        .lock()
+        .map_err(|_| anyhow!("pending auto-kudos receive state lock poisoned"))?;
+    let Some(index) = pending
+        .iter()
+        .position(|pending| inbound_payment_matches_pending_kudos(payment, pending))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(pending.remove(index)))
+}
+
+fn inbound_payment_matches_pending_kudos(payment: &Payment, pending: &PendingInboundKudos) -> bool {
+    payment
+        .amount
+        .map(|amount| amount.sats_u64() == pending.notice.amount)
+        .unwrap_or(false)
+        && payment
+            .message
+            .as_deref()
+            .and_then(clean_payment_note)
+            .as_deref()
+            == Some("Kudos!")
 }
 
 async fn maybe_notify_update_available(ws: &mut Ws, config: &Config) -> Result<()> {
@@ -1051,7 +1192,20 @@ fn command_authorized(command: &BotCommand, sender: PublicKey, config: &Config) 
     config.kudos_bot_pubkey == Some(sender) && *kudos_sender == config.owner_pubkey
 }
 
-fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCommand> {
+fn auto_kudos_message_authorized(
+    message: &AutoKudosMessage,
+    sender: PublicKey,
+    config: &Config,
+) -> bool {
+    match message {
+        AutoKudosMessage::Send(command) => command_authorized(command, sender, config),
+        AutoKudosMessage::ReceiveNotice(notice) => {
+            config.kudos_bot_pubkey == Some(sender) && notice.receiver == config.owner_pubkey
+        }
+    }
+}
+
+fn encrypted_auto_kudos_message(config: &Config, event: &Event) -> Result<AutoKudosMessage> {
     let decrypted = nip44::decrypt(
         config.bot_keys.secret_key(),
         &event.pubkey,
@@ -1060,12 +1214,22 @@ fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCom
     let value: Value = serde_json::from_str(&decrypted)?;
 
     if value.get("version").and_then(Value::as_u64) != Some(AUTO_KUDOS_PROTOCOL_VERSION) {
-        bail!("unsupported auto-kudos command version");
-    }
-    if value.get("type").and_then(Value::as_str) != Some("auto-kudos") {
-        bail!("unexpected auto-kudos command type");
+        bail!("unsupported auto-kudos message version");
     }
 
+    match value.get("type").and_then(Value::as_str) {
+        Some("auto-kudos") => {
+            parse_encrypted_auto_kudos_command(&value).map(AutoKudosMessage::Send)
+        }
+        Some("auto-kudos-receive-notice") => {
+            parse_encrypted_auto_kudos_receive_notice(&value).map(AutoKudosMessage::ReceiveNotice)
+        }
+        Some(other) => bail!("unexpected auto-kudos message type: {other}"),
+        None => bail!("auto-kudos message missing type"),
+    }
+}
+
+fn parse_encrypted_auto_kudos_command(value: &Value) -> Result<BotCommand> {
     let sender = value
         .get("sender_pubkey")
         .and_then(Value::as_str)
@@ -1106,6 +1270,46 @@ fn encrypted_auto_kudos_command(config: &Config, event: &Event) -> Result<BotCom
         receiver_display_name,
         amount,
         payable,
+        source_event_id,
+    })
+}
+
+fn parse_encrypted_auto_kudos_receive_notice(value: &Value) -> Result<AutoKudosReceiveNotice> {
+    let sender = value
+        .get("sender_pubkey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("auto-kudos receive notice missing sender_pubkey"))
+        .and_then(|pubkey| {
+            PublicKey::from_hex(pubkey)
+                .context("auto-kudos receive notice sender_pubkey is invalid")
+        })?;
+    let receiver = value
+        .get("receiver_pubkey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("auto-kudos receive notice missing receiver_pubkey"))
+        .and_then(|pubkey| {
+            PublicKey::from_hex(pubkey)
+                .context("auto-kudos receive notice receiver_pubkey is invalid")
+        })?;
+    let amount = value
+        .get("amount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("auto-kudos receive notice missing amount"))?;
+    let sender_display_name = auto_kudos_receiver_label(
+        value.get("sender_display_name").and_then(Value::as_str),
+        sender,
+    );
+    let source_event_id = value
+        .get("source_event_id")
+        .and_then(Value::as_str)
+        .filter(|source_event_id| !source_event_id.trim().is_empty())
+        .map(str::to_string);
+
+    Ok(AutoKudosReceiveNotice {
+        sender,
+        receiver,
+        sender_display_name,
+        amount,
         source_event_id,
     })
 }
@@ -1180,6 +1384,12 @@ fn build_message(channel_id: &str, content: &str, mentions: &[String]) -> Result
         tags.push(Tag::parse(&["p", pubkey])?);
     }
     Ok(EventBuilder::new(Kind::Custom(9), content, tags))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AutoKudosMessage {
+    Send(BotCommand),
+    ReceiveNotice(AutoKudosReceiveNotice),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1393,7 +1603,7 @@ fn should_notify_inbound_payment(payment: &Payment) -> bool {
         && payment.amount.is_some()
 }
 
-fn inbound_payment_notice(payment: &Payment) -> Option<String> {
+fn inbound_payment_notice(payment: &Payment, notice: &AutoKudosReceiveNotice) -> Option<String> {
     let amount = payment.amount?;
     let message = payment.message.as_deref().and_then(clean_payment_note);
     let mut lines = vec![if message.as_deref() == Some("Kudos!") {
@@ -1401,9 +1611,7 @@ fn inbound_payment_notice(payment: &Payment) -> Option<String> {
     } else {
         format!("Received {}.", format_amount(amount.sats_u64()))
     }];
-    if let Some(payer_name) = payment.payer_name.as_deref().and_then(clean_payment_note) {
-        lines.push(format!("From: {payer_name}"));
-    }
+    lines.push(format!("From: {}", notice.sender_display_name));
     if let Some(message) = message {
         lines.push(format!("Message: {message}"));
     }
@@ -2172,7 +2380,11 @@ mod tests {
             update_check_enabled: true,
         };
 
-        let command = encrypted_auto_kudos_command(&config, &event).unwrap();
+        let AutoKudosMessage::Send(command) =
+            encrypted_auto_kudos_message(&config, &event).unwrap()
+        else {
+            panic!("expected auto-kudos send command");
+        };
         assert_eq!(
             command,
             BotCommand::AutoKudosSend {
@@ -2187,6 +2399,66 @@ mod tests {
             }
         );
         assert!(command_authorized(&command, event.pubkey, &config));
+    }
+
+    #[test]
+    fn encrypted_auto_kudos_receive_notice_round_trips() {
+        let bot_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let kudos_keys = Keys::generate();
+        let sender = Keys::generate().public_key();
+        let payload = json!({
+            "version": AUTO_KUDOS_PROTOCOL_VERSION,
+            "type": "auto-kudos-receive-notice",
+            "sender_pubkey": sender.to_hex(),
+            "sender_display_name": "@Mat",
+            "receiver_pubkey": owner_keys.public_key().to_hex(),
+            "amount": 21,
+            "source_event_id": "c87370826bf84cbf48bd8e5c50d485a5df251a8b76595cc60916783ab4f5a422",
+        })
+        .to_string();
+        let encrypted = nip44::encrypt(
+            kudos_keys.secret_key(),
+            &bot_keys.public_key(),
+            payload,
+            Nip44Version::default(),
+        )
+        .unwrap();
+        let event = EventBuilder::new(
+            Kind::Ephemeral(AUTO_KUDOS_COMMAND_KIND),
+            encrypted,
+            [Tag::parse(&["p", &bot_keys.public_key().to_hex()]).unwrap()],
+        )
+        .sign_with_keys(&kudos_keys)
+        .unwrap();
+        let config = Config {
+            relay_url: DEFAULT_RELAY_URL.to_string(),
+            channel_ids: vec!["test-channel".to_string()],
+            bot_keys,
+            owner_pubkey: owner_keys.public_key(),
+            owner_auth_tag: None,
+            kudos_bot_pubkey: Some(kudos_keys.public_key()),
+            update_check_enabled: true,
+        };
+
+        let message = encrypted_auto_kudos_message(&config, &event).unwrap();
+        assert_eq!(
+            message,
+            AutoKudosMessage::ReceiveNotice(AutoKudosReceiveNotice {
+                sender,
+                receiver: owner_keys.public_key(),
+                sender_display_name: "@Mat".to_string(),
+                amount: 21,
+                source_event_id: Some(
+                    "c87370826bf84cbf48bd8e5c50d485a5df251a8b76595cc60916783ab4f5a422".to_string()
+                ),
+            })
+        );
+        assert!(auto_kudos_message_authorized(
+            &message,
+            event.pubkey,
+            &config
+        ));
     }
 
     #[test]
