@@ -1,6 +1,6 @@
 //! A deterministic Sprout bot for controlling one owner's Lexe wallet.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,7 @@ use url::Url as WsUrl;
 const DEFAULT_RELAY_URL: &str = "ws://localhost:3000";
 const AUTO_KUDOS_SUBSCRIPTION_ID: &str = "lexebot-auto-kudos";
 const OWNER_DM_SUBSCRIPTION_ID: &str = "lexebot-owner-dm";
+const USERNAME_TARGET_DISCOVERY_SUBSCRIPTION_ID: &str = "lexebot-username-target-discovery";
 const AUTO_KUDOS_COMMAND_KIND: u16 = 21_000;
 const AUTO_KUDOS_RESULT_KIND: u16 = 21_001;
 const AUTO_KUDOS_PROTOCOL_VERSION: u64 = 2;
@@ -661,9 +662,12 @@ async fn handle_plaintext_owner_dm(ws: &mut Ws, runtime: &Runtime, event: &Event
     let command_event_id = event.id.to_hex();
     let reply = match parse_command(&event.content) {
         Ok(command) if command_authorized(&command, event.pubkey, &runtime.config) => {
-            match runtime.lexe.execute(command).await {
-                Ok(Some(reply)) => reply,
-                Ok(None) => return Ok(()),
+            match resolve_manual_command_targets(ws, command).await {
+                Ok(command) => match runtime.lexe.execute(command).await {
+                    Ok(Some(reply)) => reply,
+                    Ok(None) => return Ok(()),
+                    Err(err) => format!("Lexe command failed: {err:#}"),
+                },
                 Err(err) => format!("Lexe command failed: {err:#}"),
             }
         }
@@ -677,6 +681,99 @@ async fn handle_plaintext_owner_dm(ws: &mut Ws, runtime: &Runtime, event: &Event
     send_owner_dm_message(ws, &runtime.config, &reply).await?;
     eprintln!("replied to plaintext owner DM {command_event_id}");
     Ok(())
+}
+
+async fn resolve_manual_command_targets(ws: &mut Ws, command: BotCommand) -> Result<BotCommand> {
+    let BotCommand::Send { amount, payable } = command else {
+        return Ok(command);
+    };
+
+    let Some(username) = username_target_from_payable(&payable) else {
+        if payable.trim().starts_with('@') {
+            bail!("invalid @username payment target");
+        }
+        return Ok(BotCommand::Send { amount, payable });
+    };
+
+    let target = resolve_lexebot_offer_for_username(ws, &username).await?;
+    eprintln!(
+        "resolved manual send target @{username} to {} for owner {}",
+        target.display_name,
+        target.owner.to_hex()
+    );
+
+    Ok(BotCommand::Send {
+        amount,
+        payable: target.bolt12_offer,
+    })
+}
+
+async fn resolve_lexebot_offer_for_username(
+    ws: &mut Ws,
+    username: &str,
+) -> Result<ResolvedLexeBotTarget> {
+    let profiles = fetch_profile_events(ws).await?;
+    let owner = find_user_profile_by_username(&profiles, username)?;
+    let records = profiles
+        .iter()
+        .filter_map(lexebot_discovery_from_profile)
+        .filter(|record| record.owner == owner.pubkey)
+        .collect::<Vec<_>>();
+
+    match records.as_slice() {
+        [] => bail!(
+            "found @{username}, but could not find a verified LexeBot BOLT12 offer for that user"
+        ),
+        [record] => Ok(ResolvedLexeBotTarget {
+            owner: owner.pubkey,
+            display_name: record.display_name.clone(),
+            bolt12_offer: record.bolt12_offer.clone(),
+        }),
+        _ => bail!(
+            "found multiple verified LexeBot profiles for @{username}; use a direct BOLT12 offer instead"
+        ),
+    }
+}
+
+async fn fetch_profile_events(ws: &mut Ws) -> Result<Vec<Event>> {
+    let filter = Filter::new().kind(Kind::Custom(0)).limit(500);
+    send_json(
+        ws,
+        json!(["REQ", USERNAME_TARGET_DISCOVERY_SUBSCRIPTION_ID, filter]),
+    )
+    .await?;
+
+    let mut events = Vec::new();
+    loop {
+        let text = next_text(ws, Duration::from_secs(5)).await?;
+        let value: Value = serde_json::from_str(&text)?;
+        match value.get(0).and_then(Value::as_str) {
+            Some("EVENT")
+                if value.get(1).and_then(Value::as_str)
+                    == Some(USERNAME_TARGET_DISCOVERY_SUBSCRIPTION_ID) =>
+            {
+                let event_value = value
+                    .get(2)
+                    .ok_or_else(|| anyhow!("EVENT message missing event payload"))?;
+                events.push(Event::from_json(event_value.to_string())?);
+            }
+            Some("EOSE")
+                if value.get(1).and_then(Value::as_str)
+                    == Some(USERNAME_TARGET_DISCOVERY_SUBSCRIPTION_ID) =>
+            {
+                close_subscription(ws, USERNAME_TARGET_DISCOVERY_SUBSCRIPTION_ID).await?;
+                return Ok(events);
+            }
+            Some("CLOSED")
+                if value.get(1).and_then(Value::as_str)
+                    == Some(USERNAME_TARGET_DISCOVERY_SUBSCRIPTION_ID) =>
+            {
+                let reason = value.get(2).and_then(Value::as_str).unwrap_or("");
+                bail!("relay closed username target discovery subscription: {reason}");
+            }
+            _ => {}
+        }
+    }
 }
 
 async fn handle_encrypted_auto_kudos_message(
@@ -831,6 +928,179 @@ struct AutoKudosReceiveNotice {
 struct PendingInboundKudos {
     notice: AutoKudosReceiveNotice,
     requested_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct UserProfileDiscovery {
+    pubkey: PublicKey,
+    display_name: String,
+}
+
+#[derive(Clone, Debug)]
+struct LexeBotDiscovery {
+    owner: PublicKey,
+    display_name: String,
+    bolt12_offer: String,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedLexeBotTarget {
+    owner: PublicKey,
+    display_name: String,
+    bolt12_offer: String,
+}
+
+fn username_target_from_payable(payable: &str) -> Option<String> {
+    let trimmed = payable.trim();
+    if !trimmed.starts_with('@') {
+        return None;
+    }
+    normalize_username(trimmed)
+}
+
+fn normalize_username(value: &str) -> Option<String> {
+    let username = value
+        .trim()
+        .trim_start_matches('@')
+        .trim_end_matches([',', '.', '!', '?', ':', ';']);
+    if username.is_empty()
+        || username.len() > 80
+        || username
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return None;
+    }
+    Some(username.to_ascii_lowercase())
+}
+
+fn find_user_profile_by_username(events: &[Event], username: &str) -> Result<UserProfileDiscovery> {
+    let mut matches = HashMap::new();
+    for event in events {
+        let Some(profile) = user_profile_from_profile(event, username) else {
+            continue;
+        };
+        matches.entry(profile.pubkey.to_hex()).or_insert(profile);
+    }
+
+    let mut matches = matches.into_values().collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+
+    match matches.as_slice() {
+        [] => bail!("could not find a Sprout user profile matching @{username}"),
+        [profile] => Ok(profile.clone()),
+        _ => {
+            let labels = matches
+                .iter()
+                .map(|profile| {
+                    format!(
+                        "{} ({})",
+                        profile.display_name,
+                        profile.pubkey.to_hex().chars().take(8).collect::<String>()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("found multiple Sprout user profiles matching @{username}: {labels}")
+        }
+    }
+}
+
+fn user_profile_from_profile(event: &Event, username: &str) -> Option<UserProfileDiscovery> {
+    let metadata: Value = serde_json::from_str(&event.content).ok()?;
+    if metadata.get("lexebot").is_some() || metadata.get("sparkbot").is_some() {
+        return None;
+    }
+    if !profile_matches_username(&metadata, username) {
+        return None;
+    }
+
+    let display_name = profile_display_name(&metadata).unwrap_or_else(|| {
+        format!(
+            "@{}",
+            event.pubkey.to_hex().chars().take(8).collect::<String>()
+        )
+    });
+
+    Some(UserProfileDiscovery {
+        pubkey: event.pubkey,
+        display_name,
+    })
+}
+
+fn profile_matches_username(metadata: &Value, username: &str) -> bool {
+    ["display_name", "displayName", "name", "username"]
+        .into_iter()
+        .filter_map(|field| metadata.get(field).and_then(Value::as_str))
+        .filter_map(normalize_username)
+        .any(|candidate| candidate == username)
+        || metadata
+            .get("nip05")
+            .and_then(Value::as_str)
+            .and_then(|nip05| nip05.split('@').next())
+            .and_then(normalize_username)
+            .is_some_and(|candidate| candidate == username)
+}
+
+fn profile_display_name(metadata: &Value) -> Option<String> {
+    metadata
+        .get("display_name")
+        .or_else(|| metadata.get("displayName"))
+        .or_else(|| metadata.get("name"))
+        .and_then(Value::as_str)
+        .and_then(clean_display_name)
+}
+
+fn lexebot_discovery_from_profile(event: &Event) -> Option<LexeBotDiscovery> {
+    let metadata: Value = serde_json::from_str(&event.content).ok()?;
+    let lexebot = metadata.get("lexebot")?;
+    let owner = PublicKey::from_hex(lexebot.get("owner_pubkey")?.as_str()?).ok()?;
+    let display_name = profile_display_name(&metadata)
+        .map(|name| lexebot_command_name(&name))
+        .unwrap_or_else(|| "LexeBot".to_string());
+    let bolt12_offer = lexebot.get("bolt12_offer")?.as_str()?.to_string();
+    if !bolt12_offer.to_ascii_lowercase().starts_with("lno1") {
+        return None;
+    }
+
+    let owner_auth = lexebot.get("owner_auth")?;
+    verify_auth_tag(&owner_auth.to_string(), &event.pubkey)
+        .ok()
+        .filter(|attested_owner| *attested_owner == owner)?;
+
+    Some(LexeBotDiscovery {
+        owner,
+        display_name,
+        bolt12_offer,
+    })
+}
+
+fn clean_display_name(value: &str) -> Option<String> {
+    let collapsed = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(80)
+        .collect::<String>();
+    (!collapsed.is_empty()).then_some(collapsed)
+}
+
+fn lexebot_command_name(display_name: &str) -> String {
+    let normalized = display_name
+        .trim_start_matches('@')
+        .trim_end_matches([',', '.', '!', '?', ':', ';'])
+        .to_ascii_lowercase();
+
+    if normalized == "lexebot"
+        || normalized == "lexe-bot"
+        || (normalized.starts_with("lexebot[") && normalized.ends_with(']'))
+    {
+        display_name.trim_start_matches('@').to_string()
+    } else {
+        "LexeBot".to_string()
+    }
 }
 
 async fn send_owner_dm_message(ws: &mut Ws, config: &Config, content: &str) -> Result<()> {
@@ -1356,7 +1626,8 @@ get BOLT12\n\
 fund wallet\n\
 get transactions\n\
 create invoice for ₿1,000\n\
-send ₿500 to <payment-target>",
+send ₿500 to <payment-target>\n\
+send ₿500 to @username",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -1693,7 +1964,7 @@ fn parse_auto_kudos_command(tokens: &[&str]) -> std::result::Result<BotCommand, 
 }
 
 fn command_help() -> String {
-    "use `get balance`, `get BOLT12`, `fund wallet`, `get transactions`, `create invoice for ₿1,000`, or `send ₿500 to <payment-target>`; explicit mentions like `@LexeBot get balance` work too".to_string()
+    "use `get balance`, `get BOLT12`, `fund wallet`, `get transactions`, `create invoice for ₿1,000`, or `send ₿500 to <payment-target-or-@username>`; explicit mentions like `@LexeBot get balance` work too".to_string()
 }
 
 fn parse_amount_token(token: &str) -> std::result::Result<u64, String> {
@@ -2128,6 +2399,10 @@ async fn send_json(ws: &mut Ws, value: Value) -> Result<()> {
     Ok(())
 }
 
+async fn close_subscription(ws: &mut Ws, subscription_id: &str) -> Result<()> {
+    send_json(ws, json!(["CLOSE", subscription_id])).await
+}
+
 fn required_env(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} is required"))
 }
@@ -2292,6 +2567,103 @@ mod tests {
                 payable: "lno1abc".to_string()
             })
         );
+        assert_eq!(
+            parse_command("send ₿500 to @baxen"),
+            Ok(BotCommand::Send {
+                amount: 500,
+                payable: "@baxen".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn detects_username_payment_targets() {
+        assert_eq!(
+            username_target_from_payable("@baxen").as_deref(),
+            Some("baxen")
+        );
+        assert_eq!(
+            username_target_from_payable("@Baxen,").as_deref(),
+            Some("baxen")
+        );
+        assert_eq!(username_target_from_payable("lno1abc"), None);
+        assert_eq!(username_target_from_payable("@"), None);
+        assert_eq!(username_target_from_payable("@bad name"), None);
+    }
+
+    #[test]
+    fn resolves_user_profile_and_verified_lexebot_offer() {
+        let owner_keys = Keys::generate();
+        let bot_keys = Keys::generate();
+        let owner_profile = EventBuilder::new(
+            Kind::Custom(0),
+            json!({
+                "display_name": "Baxen",
+                "name": "baxen",
+            })
+            .to_string(),
+            [],
+        )
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+        let owner_auth = compute_auth_tag(&owner_keys, &bot_keys.public_key(), "").unwrap();
+        let bot_profile = EventBuilder::new(
+            Kind::Custom(0),
+            json!({
+                "display_name": "LexeBot[Baxen]",
+                "name": "lexebot",
+                "lexebot": {
+                    "version": 2,
+                    "owner_pubkey": owner_keys.public_key().to_hex(),
+                    "owner_auth": serde_json::from_str::<Value>(&owner_auth).unwrap(),
+                    "bolt12_offer": "lno1abc",
+                    "auto_kudos": {
+                        "encrypted": "nip44",
+                        "command_kind": AUTO_KUDOS_COMMAND_KIND,
+                        "result_kind": AUTO_KUDOS_RESULT_KIND
+                    }
+                }
+            })
+            .to_string(),
+            [],
+        )
+        .sign_with_keys(&bot_keys)
+        .unwrap();
+
+        let events = vec![owner_profile, bot_profile.clone()];
+        let owner = find_user_profile_by_username(&events, "baxen").unwrap();
+        let bot = lexebot_discovery_from_profile(&bot_profile).unwrap();
+
+        assert_eq!(owner.pubkey, owner_keys.public_key());
+        assert_eq!(owner.display_name, "Baxen");
+        assert_eq!(bot.owner, owner.pubkey);
+        assert_eq!(bot.display_name, "LexeBot[Baxen]");
+        assert_eq!(bot.bolt12_offer, "lno1abc");
+    }
+
+    #[test]
+    fn rejects_unverified_lexebot_profile_discovery() {
+        let owner_keys = Keys::generate();
+        let bot_keys = Keys::generate();
+        let bot_profile = EventBuilder::new(
+            Kind::Custom(0),
+            json!({
+                "display_name": "LexeBot[Baxen]",
+                "name": "lexebot",
+                "lexebot": {
+                    "version": 2,
+                    "owner_pubkey": owner_keys.public_key().to_hex(),
+                    "owner_auth": null,
+                    "bolt12_offer": "lno1abc"
+                }
+            })
+            .to_string(),
+            [],
+        )
+        .sign_with_keys(&bot_keys)
+        .unwrap();
+
+        assert!(lexebot_discovery_from_profile(&bot_profile).is_none());
     }
 
     #[test]

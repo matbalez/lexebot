@@ -22,6 +22,7 @@ fund wallet
 get transactions
 create invoice for ₿1,000
 send ₿500 to <payment-target>
+send ₿500 to @username
 ```
 
 `get BOLT12` creates and returns a reusable Lexe BOLT12 offer with no minimum
@@ -45,6 +46,12 @@ NIP-44 path and remain encrypted.
 `<payment-target>` is passed to Lexe's generic payment parser. Use whatever the
 installed Lexe Rust SDK accepts, such as a BOLT11 invoice, BOLT12 offer, Human
 Bitcoin Address, Lightning Address, or on-chain/BIP321 URI.
+
+For `send ₿500 to @username`, LexeBot best-effort resolves the typed Sprout
+profile name to that user's verified LexeBot profile, reads its published
+BOLT12 offer, and sends that offer through the same Lexe payment path. If the
+profile or verified LexeBot offer is missing or ambiguous, LexeBot returns an
+error instead of guessing.
 
 ## Run Locally
 
